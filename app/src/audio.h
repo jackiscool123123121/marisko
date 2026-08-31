@@ -7,7 +7,9 @@
  * I2S audio output for the SP-1.
  *
  * nRF I2S0 runs as SLAVE: BCLK (3.072 MHz osc) + LRCLK (from CS42L42) are
- * external. 24-bit SWIDTH, stereo, 48 kHz. 32-bit DMA words; sample in [31:8].
+ * external. 24-bit SWIDTH, stereo, 48 kHz. 32-bit DMA words holding one
+ * right-aligned 24-bit sample in bits[23:0], sign-extended into [31:24]
+ * (nRF52840 PS; CONFIG.ALIGN changes bus framing only, not the RAM layout).
  * A dedicated feed thread keeps the TX double-buffer primed.
  *
  * codec_init() must succeed (CS42L42 PLL locked) before audio_init().

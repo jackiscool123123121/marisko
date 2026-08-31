@@ -42,6 +42,11 @@
 #define USB_CMD_WRITE_PROBE     0x0Du  /* block_addr[4 LE] → OK + result[1] (0=wfail 1=rfail 2=mismatch 3=ok); DESTRUCTIVE */
 #define USB_CMD_WRITE_STRESS    0x0Eu  /* count[4 LE] → OK + first_fail[4 LE] (0xFFFFFFFF=all ok); DESTRUCTIVE */
 #define USB_CMD_AUDIO_DIAG      0x0Fu  /* no payload → OK + audio_diag_t (6×u32 LE) feed-thread health */
+#define USB_CMD_POWER_OFF       0x10u  /* no payload -> OK, then SYSTEM_OFF.
+                                        * Software route back to the bootloader:
+                                        * SYSTEM_OFF + cleared RESETREAS is the
+                                        * documented way to return, and this works
+                                        * even if the function button is unreachable. */
 
 #define USB_STATUS_OK         0x00u
 #define USB_STATUS_ERR        0xFFu
@@ -49,4 +54,12 @@
 bool usb_cdc_init(void);
 bool usb_cdc_connected(void);
 bool usb_upload_active(void);
+
+/* Upload progress in permille (0..1000) of blocks_written/blocks_expected for
+ * the LED progress indicator. 0 if no upload is active or the total is 0. */
+uint32_t usb_upload_progress_permille(void);
+
+/* True once a POWER_OFF command has been acked; the main loop performs the
+ * actual SYSTEM_OFF so it happens outside the USB handler. */
+bool usb_power_off_requested(void);
 void usb_cdc_poll(void);

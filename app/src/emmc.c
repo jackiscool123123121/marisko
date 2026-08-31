@@ -47,6 +47,20 @@ static uint8_t  g_mb_fail;    /* 0=none 1=resp-reject 2=busy-timeout */
 static uint64_t g_busy_total; /* accumulated busy-wait µs over the session */
 static uint32_t g_busy_n;     /* blocks counted for the busy average */
 
+/* One bit-banged bus, two callers: the audio feed thread (prefetch reads, and
+ * catalog reads on song change) and the main/USB thread (rome's disk info,
+ * catalog, format, song add/remove). A command sequence is CLK/CMD/DAT0 edges
+ * with no hardware arbitration, so two threads interleaving them corrupts both
+ * transfers — garbled audio, a trashed catalog, or a wedged card. Serialize the
+ * whole bus. The CMD25 upload session holds the lock from begin() to end();
+ * k_mutex is recursive for the owning thread so the per-block calls nest.
+ *
+ * Watchdog: waiting on this lock is safe for the 5 s WDT budget because every
+ * long-running holder feeds it from inside (wait_for_data_start, the CMD25
+ * busy-wait, cmd1/cmd6/cmd7 polls). Worst-case wait is one 64-block prefetch
+ * (~65 ms), so K_FOREVER can't starve the feeder. */
+K_MUTEX_DEFINE(s_bus_lock);
+
 /* ── Clock delay ───────────────────────────────────────────────────────────── */
 
 /* ~4 µs half-period → ~125 kHz, well within 400 kHz eMMC init limit */
@@ -455,7 +469,7 @@ static void spim3_init(void)
 
 /* ── Public API ────────────────────────────────────────────────────────────── */
 
-bool emmc_init(void)
+static bool emmc_init_locked(void)
 {
 	g_rca             = 0;
 	g_capacity_blocks = 0;
@@ -546,16 +560,30 @@ bool emmc_init(void)
 	return true;
 }
 
+bool emmc_init(void)
+{
+	k_mutex_lock(&s_bus_lock, K_FOREVER);
+	bool ok = emmc_init_locked();
+	k_mutex_unlock(&s_bus_lock);
+	return ok;
+}
+
 uint8_t emmc_fail_step(void)
 {
 	return g_fail_step;
 }
 
+void emmc_bus_lock(void)   { k_mutex_lock(&s_bus_lock, K_FOREVER); }
+void emmc_bus_unlock(void) { k_mutex_unlock(&s_bus_lock); }
+
 bool emmc_read_block(uint32_t block_addr, uint8_t *buf)
 {
 	if (!g_initialized || !buf) return false;
 	if (block_addr >= g_capacity_blocks) return false;
-	return read_block_single(block_addr, buf);
+	k_mutex_lock(&s_bus_lock, K_FOREVER);
+	bool ok = read_block_single(block_addr, buf);
+	k_mutex_unlock(&s_bus_lock);
+	return ok;
 }
 
 static volatile uint32_t s_crc_errors;   /* read-CRC16 mismatches (corrupt bit-bang reads) */
@@ -566,8 +594,11 @@ bool emmc_read_blocks(uint32_t block_addr, uint8_t *buf, uint32_t num_blocks)
 {
 	if (!g_initialized || !buf || num_blocks == 0) return false;
 	if ((uint64_t)block_addr + num_blocks > (uint64_t)g_capacity_blocks) return false;
-	if (num_blocks == 1) return read_block_single(block_addr, buf);
+	if (num_blocks == 1) return emmc_read_block(block_addr, buf);
 
+	k_mutex_lock(&s_bus_lock, K_FOREVER);
+
+	bool ret = true;
 	uint8_t resp[6];
 
 	/* Verify each block's CRC16 (was drained unchecked → silent bit errors
@@ -575,12 +606,15 @@ bool emmc_read_blocks(uint32_t block_addr, uint8_t *buf, uint32_t num_blocks)
 	 * After 3 tries, return best-effort so playback continues (one click beats
 	 * a stall). The CRC16 follows the 512 data bytes, MSB byte first. */
 	for (int attempt = 0; attempt < 3; attempt++) {
-		if (!send_command(18, block_addr, resp, 48, true))
-			return false;
+		if (!send_command(18, block_addr, resp, 48, true)) {
+			ret = false;
+			goto out;
+		}
 
 		bool crc_ok = true;
+		bool aborted = false;
 		for (uint32_t i = 0; i < num_blocks; i++) {
-			if (!wait_for_data_start()) goto fail;
+			if (!wait_for_data_start()) { aborted = true; break; }
 			uint8_t *blk = buf + i * 512u;
 			read_bytes_bitbang(blk, 512);
 			uint8_t c[2];
@@ -588,16 +622,21 @@ bool emmc_read_blocks(uint32_t block_addr, uint8_t *buf, uint32_t num_blocks)
 			uint16_t got = ((uint16_t)c[0] << 8) | (uint16_t)c[1];
 			if (got != crc16(blk, 512)) { crc_ok = false; s_crc_errors++; }
 		}
+		if (aborted) {
+			cmd12_stop();
+			ret = false;
+			goto out;
+		}
 
 		for (int i = 0; i < 16; i++) clock_pulse();
 		cmd12_stop();
-		if (crc_ok) return true;
+		if (crc_ok) goto out;   /* ret is already true */
 	}
-	return true;   /* exhausted retries; data is best-effort */
+	/* exhausted retries; data is best-effort (ret stays true) */
 
-fail:
-	cmd12_stop();
-	return false;
+out:
+	k_mutex_unlock(&s_bus_lock);
+	return ret;
 }
 
 uint32_t emmc_capacity_blocks(void)
@@ -646,7 +685,30 @@ bool emmc_cache_flush(void)
 {
 	if (!g_initialized) return false;
 	/* EXT_CSD[32] FLUSH_CACHE: write 1 triggers flush; CMD6 polls until done */
-	return cmd6_switch(32, 1);
+	k_mutex_lock(&s_bus_lock, K_FOREVER);
+	bool ok = cmd6_switch(32, 1);
+	k_mutex_unlock(&s_bus_lock);
+	return ok;
+}
+
+void emmc_power_down(void)
+{
+	if (g_initialized) {
+		k_mutex_lock(&s_bus_lock, K_FOREVER);
+		if (g_cache_enabled)
+			cmd6_switch(32, 1);   /* FLUSH_CACHE: commit before the rail drops */
+		k_mutex_unlock(&s_bus_lock);
+	}
+	g_initialized = false;
+
+	/* Park CLK/CMD/DAT0 low, then cut VCCQ. Leaving them driven high into an
+	 * unpowered card back-feeds the rail through its ESD diodes. */
+	NRF_P0->OUTCLR = CLK_MASK | CMD_MASK | DAT0_MASK;
+	NRF_P0->PIN_CNF[PIN_CLK]  = CNF_OUTPUT_HD;
+	NRF_P0->PIN_CNF[PIN_CMD]  = CNF_OUTPUT_HD;
+	NRF_P0->PIN_CNF[PIN_DAT0] = CNF_OUTPUT_HD;
+	NRF_P1->OUTCLR = (1u << PIN_RST);        /* hold the card in reset */
+	NRF_P0->OUTCLR = (1u << PIN_VCCQ);       /* I/O rail off */
 }
 
 /* ── CMD25 streaming multi-block write ──────────────────────────────────────── */
@@ -656,17 +718,31 @@ bool emmc_write_multi_begin(uint32_t block_addr, uint32_t num_blocks)
 	if (!g_initialized || g_multi_active) return false;
 	if (block_addr >= g_capacity_blocks) return false;
 
+	/* Hold the bus for the WHOLE CMD25 session — released in
+	 * emmc_write_multi_end() — so nothing can interleave clocks mid-stream.
+	 * (fill_block's !emmc_write_multi_active() check still keeps the feed
+	 * thread from even trying, so it never blocks here for long.) */
+	k_mutex_lock(&s_bus_lock, K_FOREVER);
+
 	/* Set BEFORE any CMD access so fill_block's !emmc_write_multi_active()
 	 * check prevents concurrent CMD17 reads from the audio feed thread. */
 	g_multi_active = true;
 
 	/* CMD23 pre-declares the write count */
 	if (num_blocks > 0) {
-		if (!cmd23_set_block_count(num_blocks)) { g_multi_active = false; return false; }
+		if (!cmd23_set_block_count(num_blocks)) {
+			g_multi_active = false;
+			k_mutex_unlock(&s_bus_lock);
+			return false;
+		}
 	}
 
 	uint8_t resp[6];
-	if (!send_command(25, block_addr, resp, 48, false)) { g_multi_active = false; return false; }
+	if (!send_command(25, block_addr, resp, 48, false)) {
+		g_multi_active = false;
+		k_mutex_unlock(&s_bus_lock);
+		return false;
+	}
 
 	NRF_P0->OUTSET = DAT0_MASK;
 	NRF_P0->PIN_CNF[PIN_DAT0] = CNF_OUTPUT_HD;
@@ -681,10 +757,8 @@ uint32_t emmc_mb_count(void) { return g_mb_count; }
 uint8_t  emmc_mb_fail(void)  { return g_mb_fail; }
 uint32_t emmc_busy_us(void)  { return g_busy_n ? (uint32_t)(g_busy_total / g_busy_n) : 0u; }
 
-bool emmc_write_multi_block(const uint8_t *buf)
+static bool write_multi_block_locked(const uint8_t *buf)
 {
-	if (!g_multi_active || !buf) return false;
-
 	/* Pack TX buffer: start token + data + CRC16.
 	 * Compute CRC first so it's ready before SPIM3 starts. */
 	uint16_t crc = crc16(buf, 512);
@@ -744,8 +818,19 @@ bool emmc_write_multi_block(const uint8_t *buf)
 	 * end bit. If we only scanned for DAT0-high we could read "done" before
 	 * busy even asserts and fire the next block's burst into a busy card →
 	 * intermittent corruption. So: first confirm busy (DAT0 low), then wait
-	 * for release (DAT0 high). ~4M iterations ≈ ~1 s ceiling (NAND program +
-	 * occasional GC is well under that; longer = wedged card). */
+	 * for release (DAT0 high).
+	 *
+	 * ~20M iterations ≈ ~5 s ceiling. Was ~1s (4M) and that was NOT enough:
+	 * on real hardware, large uploads (tens of thousands of blocks) failed
+	 * here mid-session -- always reproducible at the SAME address for a given
+	 * upload, but a LATER upload wrote different data over that exact same
+	 * address successfully, and a third upload failed at a completely
+	 * different address. That rules out both a bad physical block (same
+	 * address later succeeded) and a fixed block-count threshold (different
+	 * uploads failed at different relative offsets). It matches an occasional
+	 * NAND garbage-collection pause on this card exceeding the old ceiling —
+	 * normal eMMC behavior, not a wedge. Upload isn't real-time, so waiting
+	 * longer here costs nothing perceptible against losing the whole upload. */
 	uint32_t bt0 = k_cycle_get_32();
 	for (int i = 0; i < 64; i++) {
 		NRF_P0->OUTSET = CLK_MASK; fast_clk_delay();
@@ -754,7 +839,7 @@ bool emmc_write_multi_block(const uint8_t *buf)
 		if (low) break;   /* busy asserted */
 	}
 	bool done = false;
-	for (uint32_t t = 0; t < 4000000u; t++) {
+	for (uint32_t t = 0; t < 20000000u; t++) {
 		NRF_P0->OUTSET = CLK_MASK;
 		fast_clk_delay();
 		if ((NRF_P0->IN >> PIN_DAT0) & 1u) done = true;
@@ -777,6 +862,19 @@ bool emmc_write_multi_block(const uint8_t *buf)
 	return done;
 }
 
+bool emmc_write_multi_block(const uint8_t *buf)
+{
+	if (!buf) return false;
+	/* Lock BEFORE testing g_multi_active: the session owner already holds the
+	 * lock (recursive re-entry is free), and any other thread waits here until
+	 * _end() releases it, by which point g_multi_active is false and it bails
+	 * instead of blasting a block into a closed session. */
+	k_mutex_lock(&s_bus_lock, K_FOREVER);
+	bool ok = g_multi_active ? write_multi_block_locked(buf) : false;
+	k_mutex_unlock(&s_bus_lock);
+	return ok;
+}
+
 bool emmc_write_multi_end(void)
 {
 	if (!g_multi_active) return false;
@@ -792,8 +890,10 @@ bool emmc_write_multi_end(void)
 	NRF_P0->PIN_CNF[PIN_DAT0] = CNF_INPUT_PULLUP;
 	for (int i = 0; i < 16; i++) fast_clock_pulse();
 
+	/* Same ~5 s ceiling as the per-block wait above, and for the same reason:
+	 * the final block's NAND program can be the one that hits a GC pause. */
 	bool done = false;
-	for (uint32_t t = 0; t < 4000000u; t++) {
+	for (uint32_t t = 0; t < 20000000u; t++) {
 		NRF_P0->OUTSET = CLK_MASK;
 		fast_clk_delay();
 		if ((NRF_P0->IN >> PIN_DAT0) & 1u) done = true;
@@ -809,16 +909,14 @@ bool emmc_write_multi_end(void)
 	/* Flush write cache to NAND so data survives a power cycle */
 	if (g_cache_enabled)
 		cmd6_switch(32, 1);
+	k_mutex_unlock(&s_bus_lock);   /* matches the lock taken in _begin() */
 	return done;
 }
 
 /* ── CMD24 single-block write ────────────────────────────────────────────────── */
 
-bool emmc_write_block(uint32_t block_addr, const uint8_t *buf)
+static bool write_block_locked(uint32_t block_addr, const uint8_t *buf)
 {
-	if (!g_initialized || !buf) return false;
-	if (block_addr >= g_capacity_blocks) return false;
-
 	uint8_t resp[6];
 	if (!send_command(24, block_addr, resp, 48, false)) return false;
 
@@ -873,17 +971,31 @@ bool emmc_write_block(uint32_t block_addr, const uint8_t *buf)
 		return false;
 	}
 
-	/* Wait for not-busy: DAT0 high = card finished writing */
+	/* Wait for not-busy: DAT0 high = card finished writing. Widened to match
+	 * the CMD25 path's ~5 s GC-stall ceiling (was ~0.5 s with no watchdog feed
+	 * at all -- several of these back-to-back, e.g. disk_add_song scanning
+	 * multiple catalog entries on a slow card, could eat the WDT budget). */
 	bool done = false;
-	for (uint32_t t = 0; t < 2000000u; t++) {
+	for (uint32_t t = 0; t < 10000000u; t++) {
 		NRF_P0->OUTSET = CLK_MASK;
 		fast_clk_delay();
 		if ((NRF_P0->IN >> PIN_DAT0) & 1u) done = true;
 		NRF_P0->OUTCLR = CLK_MASK;
 		fast_clk_delay();
 		if (done) break;
+		if ((t & 0x3FFFFu) == 0u) feed_wdt();
 	}
 
 	for (int i = 0; i < 16; i++) fast_clock_pulse();
 	return done;
+}
+
+bool emmc_write_block(uint32_t block_addr, const uint8_t *buf)
+{
+	if (!g_initialized || !buf) return false;
+	if (block_addr >= g_capacity_blocks) return false;
+	k_mutex_lock(&s_bus_lock, K_FOREVER);
+	bool ok = write_block_locked(block_addr, buf);
+	k_mutex_unlock(&s_bus_lock);
+	return ok;
 }

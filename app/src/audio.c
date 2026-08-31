@@ -9,7 +9,12 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/i2s.h>
 
-/* 24-bit SWIDTH, stereo, 48 kHz. DMA word = {sample[23:0], 8'h00} per channel. */
+/* 24-bit SWIDTH, stereo, 48 kHz. Per the nRF52840 PS (I2S → EasyDMA), a memory
+ * word at SWIDTH=24Bit holds "one right-aligned 24-bit sample sign extended to
+ * 32 bit" — i.e. sample in bits[23:0], NOT bits[31:8]. CONFIG.ALIGN (which
+ * Zephyr sets to Left for I2S format) only affects framing on the wire, not the
+ * RAM layout. So a 16-bit sample is scaled to full 24-bit scale with << 8.
+ * Do not "fix" that shift to << 16 — it would clip everything by 8 bits. */
 #define FRAMES_PER_BLOCK 128u
 #define CHANNELS         2u
 #define BYTES_PER_WORD   4u
@@ -29,9 +34,14 @@ static volatile audio_source_t s_source = AUDIO_SRC_SILENCE;
 static volatile bool s_running;
 
 /* ── 440 Hz sine via a 2nd-order resonator (no libm) ─────────────────────── */
-#define TONE_A   4.0e7f   /* y1_init ≈ 2.3e6, within 24-bit ±8.4e6 range */
-#define TONE_K   1.9966822f
-#define TONE_SW  0.0575539f
+/* y[n] = K·y[n-1] − y[n-2] with y[-1]=0, y[0]=A·sin(w) gives y[n] = A·sin(w(n+1)),
+ * so TONE_A is the PEAK, not the seed. The old 4.0e7 was 4.8× past 24-bit full
+ * scale (±8388607) and wrapped into a buzz — the "y1_init ≈ 2.3e6 fits" note
+ * only checked the first sample. 2.0e6 ≈ −12 dBFS: clearly audible as a fault
+ * indicator without being painful. */
+#define TONE_A   2.0e6f
+#define TONE_K   1.9966822f   /* 2·cos(2π·440/48000) */
+#define TONE_SW  0.0575539f   /*   sin(2π·440/48000) */
 static float s_y1, s_y2;
 
 static void tone_reset(void)
@@ -84,7 +94,11 @@ static void change_song(int dir)
 	for (int step = 1; step <= n; step++) {
 		int idx = ((int)s_cur_song + dir * step) % n;
 		if (idx < 0) idx += n;
-		if (disk_read_song((uint16_t)idx, &e) && e.name[0] != '\0') {
+		/* block_count == 0 must be skipped like a free slot: adopting it makes
+		 * the refill below ask for 0 blocks, emmc_read_blocks fails, and the
+		 * feed falls through to the 440 Hz error tone — forever, since the
+		 * position never advances past the end. */
+		if (disk_read_song((uint16_t)idx, &e) && e.name[0] != '\0' && e.block_count > 0) {
 			s_cur_song          = (uint16_t)idx;
 			s_song_block_start  = e.block_start;
 			s_song_block_count  = e.block_count;
@@ -274,7 +288,12 @@ static void fill_block(int32_t *buf)
 			if (bufpeak > s_peak) s_peak = bufpeak;
 			return;
 		}
-tone_fallback:;
+tone_fallback:
+		/* Seed the resonator on first use. tone_reset() is otherwise only
+		 * reached via audio_set_source(AUDIO_SRC_TONE), which main never calls
+		 * — so both state vars sat at 0 and this "audible indicator" emitted
+		 * pure silence, making a failed eMMC read look like a quiet passage. */
+		if (s_y1 == 0.0f && s_y2 == 0.0f) tone_reset();
 		/* eMMC read failed: output tone as audible indicator (vs silence = invisible) */
 		for (uint32_t i = 0; i < FRAMES_PER_BLOCK; i++) {
 			float y = TONE_K * s_y1 - s_y2;
@@ -330,7 +349,12 @@ static void feed_main(void *a, void *b, void *c)
 			 * before the next ~20 ms eMMC prefetch read completes and underruns
 			 * again, cascading. Full runway lets a transient underrun self-heal. */
 			for (int i = 0; i < (int)NUM_BLOCKS - 1; i++) {
-				if (k_mem_slab_alloc(&s_tx_slab, &blk, K_FOREVER) != 0) break;
+				/* Bounded, NOT K_FOREVER: this assumed DROP always returns every
+				 * queued buffer to the slab. If DROP fails (i2s in an error
+				 * state) nothing is freed, and a K_FOREVER alloc parks the feed
+				 * thread for good — audio dies permanently with no way back,
+				 * since only this thread can restart the stream. */
+				if (k_mem_slab_alloc(&s_tx_slab, &blk, K_MSEC(I2S_TIMEOUT_MS)) != 0) break;
 				fill_block((int32_t *)blk);
 				if (i2s_write(s_i2s, blk, BLOCK_BYTES) != 0) {
 					k_mem_slab_free(&s_tx_slab, blk);

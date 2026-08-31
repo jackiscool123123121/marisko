@@ -46,6 +46,8 @@ typedef struct {
 } disk_song_entry_t;
 
 /* Master header — exactly 512 bytes. */
+#define DISK_SETTINGS_MAGIC 0xA5u   /* settings_magic value once vol_level has been saved */
+
 typedef struct {
     uint32_t magic;           /* DISK_MAGIC */
     uint8_t  version;         /* DISK_VERSION */
@@ -53,7 +55,13 @@ typedef struct {
     uint16_t song_count;      /* entries allocated (including deleted holes) */
     uint8_t  _pad1[2];
     uint32_t next_free_block; /* first unallocated audio block */
-    uint8_t  _pad2[496];
+    /* Persisted user settings, carved from what was reserved padding. A header
+     * written before this field existed reads settings_magic as 0 (padding was
+     * always zeroed by disk_format), which is != DISK_SETTINGS_MAGIC, so it is
+     * correctly treated as "no saved settings" rather than a bogus vol_level. */
+    uint8_t  settings_magic;  /* DISK_SETTINGS_MAGIC once vol_level below is valid */
+    uint8_t  vol_level;       /* saved master volume, 0..7 */
+    uint8_t  _pad2[494];
 } disk_header_t;
 
 /* ── API ────────────────────────────────────────────────────────────────────── */

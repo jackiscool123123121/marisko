@@ -127,6 +127,16 @@ static bool ensure_hdr(void)
 
 static void handle_ping(void) { send_ok(NULL, 0); }
 
+/* 0x10 POWER_OFF: ack first, then let the main loop drop into SYSTEM_OFF. Acking
+ * first matters — once SYSTEM_OFF runs, USB is gone and the host would time out. */
+static volatile bool g_power_off_req;
+bool usb_power_off_requested(void) { return g_power_off_req; }
+static void handle_power_off(void)
+{
+	send_ok(NULL, 0);
+	g_power_off_req = true;
+}
+
 static void handle_disk_info(void)
 {
 	if (!emmc_read_block(0, s_block_buf)) { send_err(); return; }
@@ -214,26 +224,20 @@ static void handle_codec_diag(void)
 	codec_refresh_diag();
 	codec_diag_t diag;
 	codec_get_diag(&diag);
-	/* Stash playback position into the pad bytes (offset 23..26) for diagnostics. */
-	uint32_t cb = audio_cur_block();
-	((uint8_t *)&diag)[23] = (uint8_t)(cb);
-	((uint8_t *)&diag)[24] = (uint8_t)(cb >> 8);
-	((uint8_t *)&diag)[25] = (uint8_t)(cb >> 16);
-	((uint8_t *)&diag)[26] = (uint8_t)(cb >> 24);
-	uint32_t ru = audio_last_read_us();
-	((uint8_t *)&diag)[27] = (uint8_t)(ru);
-	((uint8_t *)&diag)[28] = (uint8_t)(ru >> 8);
-	/* Upload-fail diag: fail block (23..26), fail reason (28: 1=usb 2=write). */
-	((uint8_t *)&diag)[23] = (uint8_t)(g_ul_fail_block);
-	((uint8_t *)&diag)[24] = (uint8_t)(g_ul_fail_block >> 8);
-	((uint8_t *)&diag)[25] = (uint8_t)(g_ul_fail_block >> 16);
-	((uint8_t *)&diag)[26] = (uint8_t)(g_ul_fail_block >> 24);
-	((uint8_t *)&diag)[28] = g_ul_fail;
-	/* Live AIN1 (ladder 2: vol up/down + FWD/RWD) into bytes 29..30. */
+	/* Named fields now, same wire offsets as before (23..26, 28, 29..30). The
+	 * old byte-poking also wrote cur_block/last_read_us into 23..28 and then
+	 * immediately overwrote them with this, so that pair never reached the host
+	 * — dropped rather than resurrected, since AUDIO_DIAG already reports both. */
+	diag.ul_fail_block[0] = (uint8_t)(g_ul_fail_block);
+	diag.ul_fail_block[1] = (uint8_t)(g_ul_fail_block >> 8);
+	diag.ul_fail_block[2] = (uint8_t)(g_ul_fail_block >> 16);
+	diag.ul_fail_block[3] = (uint8_t)(g_ul_fail_block >> 24);
+	diag.ul_fail = g_ul_fail;
+	/* Live AIN1 (ladder 2: vol up/down + FWD/RWD). */
 	int ain1 = saadc_read(2u);  /* PSELP=2 → AIN1 */
 	if (ain1 < 0) ain1 = 0;
-	((uint8_t *)&diag)[29] = (uint8_t)(ain1);
-	((uint8_t *)&diag)[30] = (uint8_t)((uint32_t)ain1 >> 8);
+	diag.ain1[0] = (uint8_t)(ain1);
+	diag.ain1[1] = (uint8_t)((uint32_t)ain1 >> 8);
 	send_ok((const uint8_t *)&diag, sizeof(diag));
 }
 
@@ -256,11 +260,15 @@ static void handle_disk_format(void)
 static void handle_song_begin(const uint8_t *payload, uint32_t plen)
 {
 	if (plen < 28) { send_err(); return; }
-	if (!ensure_hdr()) { send_err(); return; }
 	if (g_upload.active) { send_err(); return; }
 
-	/* Pause audio so feed thread stops issuing CMD17 reads during disk ops */
+	/* Pause audio BEFORE the first disk touch — ensure_hdr() reads block 0, so
+	 * pausing after it left that read racing the feed thread. (The eMMC bus
+	 * lock makes this correct either way; pausing first just keeps the feed
+	 * from queueing up behind rome's disk ops.) */
 	audio_pause();
+
+	if (!ensure_hdr()) { send_err(); return; }
 
 	uint32_t audio_blocks = (uint32_t)payload[24]        | ((uint32_t)payload[25] << 8) |
 	                        ((uint32_t)payload[26] << 16) | ((uint32_t)payload[27] << 24);
@@ -297,8 +305,11 @@ static void handle_song_begin(const uint8_t *payload, uint32_t plen)
  * CMD25 streaming (SPIM3 16 MHz burst per block) with the write cache on — the
  * fast path. Session opened lazily on the first batch, kept open across batches,
  * closed at SONG_COMMIT. */
-static void handle_song_multiblock(const uint8_t *count_payload)
+static void handle_song_multiblock(const uint8_t *count_payload, uint32_t plen)
 {
+	/* Without the length check a short/empty packet reads the count out of
+	 * whatever the previous command left in s_block_buf. */
+	if (plen < 2) { send_err(); return; }
 	uint16_t count = (uint16_t)count_payload[0] | ((uint16_t)count_payload[1] << 8);
 	if (!g_upload.active || count == 0) { send_err(); return; }
 	if ((uint32_t)g_upload.blocks_written + count > g_upload.blocks_expected) {
@@ -380,6 +391,16 @@ static void handle_song_commit(void)
 
 	if (!disk_write_header(&g_hdr)) { send_err(); return; }
 	g_hdr_cached = true;
+
+	/* Arm the song we just wrote so it is playable immediately. The catalog
+	 * scan only ran once at boot (main.c), so uploading to a device that had
+	 * no songs left the feed thread with block_count == 0 — play did nothing
+	 * until a reboot, with no indication why. */
+	audio_set_source(AUDIO_SRC_ADPCM);
+	audio_set_playlist(g_hdr.song_count, g_upload.song_idx);
+	audio_set_levels_enabled(g_hdr.version >= 2);
+	audio_load_song(g_upload.block_start, g_upload.audio_blocks);
+
 	send_ok(NULL, 0);
 }
 
@@ -420,13 +441,14 @@ static void dispatch(uint8_t cmd, const uint8_t *payload, uint32_t plen)
 	case USB_CMD_SONG_COMMIT:  handle_song_commit();                   break;
 	case USB_CMD_SONG_REMOVE:  handle_song_remove(payload, plen);      break;
 	case USB_CMD_CATALOG_READ:    handle_catalog_read();                break;
-	case USB_CMD_SONG_MULTIBLOCK: handle_song_multiblock(s_block_buf); break;
+	case USB_CMD_SONG_MULTIBLOCK: handle_song_multiblock(payload, plen); break;
 	case USB_CMD_EXTCSD_DUMP:     handle_extcsd_dump();                 break;
 	case USB_CMD_CODEC_DIAG:      handle_codec_diag();                  break;
 	case USB_CMD_READ_BLOCK:      handle_read_block(payload, plen);     break;
 	case USB_CMD_WRITE_PROBE:     handle_write_probe(payload, plen);    break;
 	case USB_CMD_WRITE_STRESS:    handle_write_stress(payload, plen);   break;
 	case USB_CMD_AUDIO_DIAG:      handle_audio_diag();                  break;
+	case USB_CMD_POWER_OFF:       handle_power_off();                   break;
 	default:                      send_err();                          break;
 	}
 }
@@ -445,6 +467,13 @@ bool usb_cdc_init(void)
 bool usb_upload_active(void)
 {
 	return g_upload.active;
+}
+
+uint32_t usb_upload_progress_permille(void)
+{
+	if (!g_upload.active || g_upload.blocks_expected == 0) return 0;
+	uint64_t pm = (uint64_t)g_upload.blocks_written * 1000u / g_upload.blocks_expected;
+	return (uint32_t)(pm > 1000u ? 1000u : pm);
 }
 
 bool usb_cdc_connected(void)

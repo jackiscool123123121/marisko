@@ -38,6 +38,14 @@ bool codec_headphone_mute(bool mute);
  * Exact dB/step is uncalibrated — tune the table in main.c by ear. */
 bool codec_headphone_volume(uint8_t vol);
 
+/* Quiet both output stages and power them down for SYSTEM_OFF. SYSTEM_OFF only
+ * stops the nRF — the TAS2505, the CS42L42 and the 3.072 MHz oscillator are
+ * separate chips whose retained GPIO levels keep them powered (battery drain),
+ * and a powered amp with no clock can murmur on its own. Mutes first so the
+ * drivers discharge quietly instead of stepping to ground (power-off pop),
+ * then holds both codecs in reset and kills the oscillator. */
+void codec_power_down(void);
+
 /* True if headphones are plugged into the TRRS jack. Reads CS42L42
  * TSRS_PLUG_STATUS (0x130F): plugged when ((reg & 0x0C) >> 2) == 0x03
  * (logic from the sp1-midi cs42l42_codec_is_headphone_connected). Tip-sense
@@ -68,11 +76,19 @@ typedef struct {
 	uint8_t  live_tas_p0r64; /* DAC vol now */
 	uint8_t  live_tas_p0r65; /* DAC L vol now */
 	uint8_t  live_tas_p0r25; /* clock mux status */
-	int8_t   audio_i2s_cfg_ret; /* i2s_configure() return code */
-	uint8_t  audio_stage;       /* how far audio_init() progressed (see audio.c) */
-	uint8_t  live_cs_osc_sw;    /* CS42L42 0x1109 osc switch status (0x02 = SCLK→MCLK ok) */
-	uint8_t  live_cs_hp_ctl;    /* CS42L42 0x2001 HP_CTL now (0x01 unmuted, 0x0D muted) */
-	uint8_t  _pad[7];
+	int8_t   audio_i2s_cfg_ret; /* 21: i2s_configure() return code */
+	uint8_t  audio_stage;       /* 22: how far audio_init() progressed (see audio.c) */
+	/* Bytes 23..26, 28 and 29..30 are filled in by the USB layer (upload-fail
+	 * diagnostics + live AIN1) after codec_get_diag() copies this struct out.
+	 * They used to overlap live_cs_osc_sw/live_cs_hp_ctl, which meant those two
+	 * registers were read every time and then immediately overwritten — the
+	 * host never saw them. Moved to 27 and 31, the only bytes the USB layer
+	 * does not touch, so rome's existing offsets are unchanged. */
+	uint8_t  ul_fail_block[4];  /* 23..26: block index where an upload failed */
+	uint8_t  live_cs_osc_sw;    /* 27: CS42L42 0x1109 osc switch (0x02 = SCLK→MCLK ok) */
+	uint8_t  ul_fail;           /* 28: 0=none 1=usb-read-timeout 2=write-fail */
+	uint8_t  ain1[2];           /* 29..30: raw AIN1 (vol +/- and FWD/RWD ladder) */
+	uint8_t  live_cs_hp_ctl;    /* 31: CS42L42 0x2001 HP_CTL (0x01 unmuted, 0x0D muted) */
 } codec_diag_t;
 
 /* Re-read live codec state into the diag struct (called before reporting). */

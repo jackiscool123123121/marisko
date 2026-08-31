@@ -4,6 +4,10 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/i2c.h>
 
+/* usb.c fills bytes 23..26, 28 and 29..30 by name and rome reads them by
+ * offset, so the layout is wire format — pin the size. */
+_Static_assert(sizeof(codec_diag_t) == 32, "codec_diag_t must stay 32 bytes");
+
 /* ── Pins (raw GPIO) ─────────────────────────────────────────────────────────── */
 #define PIN_OSC_EN   13u   /* P0.13 — 3.072 MHz oscillator enable (active high) */
 #define PIN_CS_RST   15u   /* P0.15 — CS42L42 reset (active low) */
@@ -363,6 +367,35 @@ bool codec_headphones_present(void)
 	uint8_t v = 0;
 	if (!cs_read(CS_DETECT_STATUS1, &v)) return false;
 	return (v >> 7) & 0x01u;
+}
+
+void codec_power_down(void)
+{
+	/* Order matters: amp, then codec, then the oscillator they both clock off.
+	 * Mute before cutting anything so the drivers discharge quietly.
+	 *
+	 * Each i2c_write here can block up to CONFIG_I2C_NRFX_TRANSFER_TIMEOUT
+	 * (500 ms) if the bus is wedged, and tas_write/cs_write each cost up to two
+	 * transactions (page select + data). Worst case is several seconds with no
+	 * watchdog feed in between — feed after every call so a stuck bus can never
+	 * eat the 5 s budget silently. */
+	s_tas_page = -1;
+	tas_write(1, 48, 0x00);   /* TAS2505 Class-D driver mute (P1/R48) */
+	feed_wdt();
+	tas_write(1, 46, 0x7F);   /* speaker volume → mute */
+	feed_wdt();
+	s_cs_page = -1;
+	cs_write(CS_HP_CTL, CS_HP_CTL_MUTED);
+	feed_wdt();
+	delay_ms(30);
+
+	tas_write(0, 1, 0x01);    /* TAS2505 software reset: every block to its
+	                           * powered-down default */
+	feed_wdt();
+	gpio_out(PIN_CS_RST, 0);  /* hold CS42L42 in reset */
+	gpio_out(PIN_TAS_RST, 0); /* hold TAS2505 in reset */
+	gpio_out(PIN_OSC_EN, 0);  /* 3.072 MHz oscillator off — it would otherwise
+	                           * keep drawing battery straight through SYSTEM_OFF */
 }
 
 void codec_refresh_diag(void)

@@ -11,22 +11,135 @@
 #include "audio.h"
 #include "disk.h"
 
+struct btn_db { bool raw_prev, stable; uint8_t cnt; };
+
+/* Current 0..7 master volume level, and whether it's changed since the last
+ * disk write. Declared here (not next to s_meter_ticks below, where this used
+ * to live) because settings_flush() -- used by enter_system_off(), which sits
+ * above the rest of main()'s UI state -- needs both in scope first. */
+static volatile int s_vol_level = 3;
+static bool g_settings_dirty;
+
 /* On any fatal error (incl. stack-overflow fault with HW_STACK_PROTECTION):
  * light all 8 LEDs solid and feed the WDT forever, so a crash is visible. */
 void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf)
 {
 	(void)reason; (void)esf;
 	for (int i = 0; i < NUM_PB_LEDS; i++) set_pb_on(i);
-	for (int i = 0; i < 4; i++) set_trk_on(i);
+	/* Track LEDs are driven by PWM0, which owns those pins via PSEL — the GPIO
+	 * OUTSET in set_trk_on() is overridden and they stayed dark, so a crash
+	 * only lit half the panel. Go through PWM0 (its DMA keeps looping without
+	 * the CPU, so this still works from a fault context). */
+	for (int i = 0; i < NUM_TRK_LEDS; i++) pwm0_set_duty(i, PWM_TOP);
 	for (;;) feed_wdt();
 }
 
 /* ── Power ─────────────────────────────────────────────────────────────────── */
 
+/* Re-read the header fresh right before writing rather than keeping our own
+ * cached copy: main's loop also runs usb_cdc_poll(), and a song add/remove/
+ * commit updates the on-disk header via its OWN copy (g_hdr in usb.c) at any
+ * point in that same loop. Writing a stale copy here would roll song_count /
+ * next_free_block back and corrupt the catalog. Call only outside an upload
+ * (usb_upload_active()) so this never lands mid-sequence. On an unformatted
+ * disk, disk_read_header fails and this is a no-op every time it's tried --
+ * cheap (one failed block read) and harmless. */
+static void settings_flush(void)
+{
+	static disk_header_t s_save_hdr;
+	if (!disk_read_header(&s_save_hdr)) return;
+	s_save_hdr.settings_magic = DISK_SETTINGS_MAGIC;
+	s_save_hdr.vol_level = (uint8_t)s_vol_level;
+	if (disk_write_header(&s_save_hdr))
+		g_settings_dirty = false;
+}
+
+/* 2-consecutive-reads debounce for a ladder-window test. See the comment on
+ * the btn_db block in main() for why this exists. */
+static bool debounce(bool raw, struct btn_db *b)
+{
+	if (raw == b->raw_prev) {
+		if (b->cnt < 2) b->cnt++;
+	} else {
+		b->raw_prev = raw;
+		b->cnt = 0;
+	}
+	if (b->cnt >= 2) b->stable = raw;
+	return b->stable;
+}
+
 static void enter_system_off(void)
 {
-	all_pb_off();
+	/* "LEDs go dark" is the documented signal that the device powered off and
+	 * the bootloader is reachable — so every LED must actually be dark before
+	 * SYSTEMOFF. A stopped PWM holds its outputs at the last driven level and
+	 * keeps the pins via PSEL, so TASKS_STOP alone froze the track LEDs mid-VU
+	 * (and PWM1/pb was never stopped at all). Stop both, hand the pins back to
+	 * GPIO, and drive them low. */
 	NRF_PWM0->TASKS_STOP = 1;
+	NRF_PWM1->TASKS_STOP = 1;
+	for (int i = 0; i < 4; i++) {
+		NRF_PWM0->PSEL.OUT[i] = 0xFFFFFFFFu;
+		NRF_PWM1->PSEL.OUT[i] = 0xFFFFFFFFu;
+	}
+	for (int i = 0; i < NUM_PB_LEDS; i++) {
+		pb_leds[i].port->PIN_CNF[pb_leds[i].pin] = GPIO_OUT_CNF;
+		pb_leds[i].port->OUTCLR = (1u << pb_leds[i].pin);
+	}
+	for (int i = 0; i < NUM_TRK_LEDS; i++) {
+		track_leds[i].port->PIN_CNF[track_leds[i].pin] = GPIO_OUT_CNF;
+		track_leds[i].port->OUTCLR = (1u << track_leds[i].pin);
+	}
+
+	/* Arm wake-on-press so the device can be brought back with no cable.
+	 *
+	 * Nothing armed a wake source before, so SYSTEM OFF could only be escaped
+	 * by USB VBUS — "press any button" in the readme could never have worked.
+	 * The function button (P0.27) is the only wake candidate: every other
+	 * button sits on an analog resistor ladder into AIN0/AIN1 and cannot drive
+	 * the GPIO DETECT signal.
+	 *
+	 * Order matters. If DETECT is already asserted when SYSTEMOFF is written,
+	 * the chip resets instead of powering down — so wait for the button the
+	 * user is still holding to come back up, settle the contact bounce, clear
+	 * any latched event, and only then enable SENSE.
+	 *
+	 * Bounded (~3 s): if the contact ever reads stuck-low, fall through and
+	 * power down anyway rather than spinning here forever with the LEDs
+	 * already dark — worst case DETECT is live and the chip resets into the
+	 * bootloader, which is still a usable outcome. */
+	/* Power down the external chips FIRST, while the user is still holding the
+	 * button — that hold doubles as the settle time for the amp to discharge.
+	 * SYSTEM_OFF only stops the nRF; the amp, the headphone codec, the
+	 * oscillator and the eMMC I/O rail are separate parts kept alive by the
+	 * retained GPIO levels, so they would drain the battery for days, and a
+	 * clocked-but-unmuted amp can murmur on its own. (Both helpers mute before
+	 * cutting, so the drivers discharge quietly rather than stepping to ground
+	 * — that step is the power-off pop.) */
+	if (g_settings_dirty) settings_flush();
+
+	codec_power_down();
+	emmc_power_down();
+	feed_wdt();
+
+	/* k_msleep, not delay_ms: this must not busy-burn ~96k instructions per ms
+	 * for up to three seconds. Sleeping yields to the other threads and lets
+	 * the kernel idle. */
+	for (int i = 0; i < 150 && !(NRF_P0->IN & (1u << 27)); i++) {
+		k_msleep(20);
+		feed_wdt();
+	}
+	k_msleep(60);   /* debounce the release */
+
+	NRF_P0->LATCH = 0xFFFFFFFFu;
+
+	NRF_P0->PIN_CNF[27] =
+		(GPIO_PIN_CNF_DIR_Input     << GPIO_PIN_CNF_DIR_Pos)   |
+		(GPIO_PIN_CNF_PULL_Pullup   << GPIO_PIN_CNF_PULL_Pos)  |
+		(GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
+		(GPIO_PIN_CNF_SENSE_Low     << GPIO_PIN_CNF_SENSE_Pos);
+	__DSB();
+
 	feed_wdt();
 	NRF_POWER->RESETREAS = 0xFFFFFFFF;
 	NRF_POWER->SYSTEMOFF  = 1;
@@ -85,7 +198,6 @@ static uint8_t track_mask(int al)
 
 /* Shared UI state: the buttons (main thread) write these, the UI thread reads
  * them to render the pb-LED meter. */
-static volatile int s_vol_level   = 3;   /* current 0..7 volume level */
 static volatile int s_meter_ticks = 0;   /* >0 = show the volume bar (UI counts down) */
 
 /* Stem on/off (track-button tap) + momentary solo (track-button hold), folded
@@ -94,6 +206,11 @@ static volatile int s_meter_ticks = 0;   /* >0 = show the volume bar (UI counts 
  * muted at once (independent taps). */
 static volatile uint8_t s_stem_muted[4] = {0, 0, 0, 0};
 static volatile uint8_t s_solo_mask = 0;
+
+/* Set by main() while it owns both LED rows for a gesture animation (the
+ * power-off hold countdown, currently) so the UI thread's own ~125 Hz VU/meter
+ * rendering doesn't fight it for the same PWM channels every 8 ms tick. */
+static volatile bool s_gesture_active;
 
 K_THREAD_STACK_DEFINE(s_ui_stack, 1024);
 static struct k_thread s_ui_thread;
@@ -127,6 +244,18 @@ static void ui_main(void *a, void *b, void *c)
 	bool    trk_soloed  = false;  /* this hold has activated solo */
 	uint8_t trk_last    = 0;      /* last non-zero held mask (for tap-toggle) */
 	int64_t trk_press_ms = 0;
+	/* Debounce the DECODED mask, not the raw ADC sample. The ladder read was
+	 * fed straight into press/release/live-solo logic every ~8 ms tick with no
+	 * filtering: a single noisy sample landing near a different table entry
+	 * (finger pressure shifting the ladder resistance, ADC jitter) instantly
+	 * changed which stem was soloed for that tick ("another stem cuts in"),
+	 * and a one-tick glitch to 0 mid-hold looked like a release+re-press —
+	 * toggling mute TWICE for one physical tap ("one click registers as two").
+	 * Require 2 consecutive identical decodes (~16 ms) before accepting any
+	 * change; a lone glitch never survives two ticks. */
+	uint8_t trk_pending  = 0;
+	uint8_t trk_pend_cnt = 0;
+	uint8_t trk_stable   = 0;
 
 	while (1) {
 		/* Faders → per-stem mix gain. Sample ONE fader per tick (round-robin):
@@ -145,7 +274,15 @@ static void ui_main(void *a, void *b, void *c)
 		/* Track buttons on AIN0 → bitmask of held stems. Tap toggles them; a
 		 * hold >250 ms solos them, and the solo set follows the held buttons
 		 * live (add/remove a finger to change it). */
-		uint8_t cur = track_mask(saadc_read(1u));
+		uint8_t raw_mask = track_mask(saadc_read(1u));
+		if (raw_mask == trk_pending) {
+			if (trk_pend_cnt < 250) trk_pend_cnt++;
+		} else {
+			trk_pending = raw_mask;
+			trk_pend_cnt = 1;
+		}
+		if (trk_pend_cnt >= 2) trk_stable = trk_pending;
+		uint8_t cur = trk_stable;
 		if (cur) {
 			if (!trk_held) { trk_press_ms = k_uptime_get(); trk_soloed = false; trk_held = true; }
 			trk_last = cur;
@@ -195,18 +332,37 @@ static void ui_main(void *a, void *b, void *c)
 			vu_disp = 0;
 			fill = 0;
 		}
-		for (int s = 0; s < NUM_PB_LEDS; s++) {
-			int b = fill - s * PWM_TOP;
-			if (b < 0)       b = 0;
-			if (b > PWM_TOP) b = PWM_TOP;
-			pwm1_set_duty(NUM_PB_LEDS - 1 - s, (uint16_t)b);
-		}
+		if (!s_gesture_active && usb_upload_active()) {
+			/* Upload progress: N of 4 pb LEDs BLINKING (not a solid fill, so it
+			 * reads as distinct from the playback VU meter at a glance) where N
+			 * is the quarter of the upload reached -- 1 LED in the first
+			 * quarter, up to all 4 as it nears completion. Track LEDs go dark;
+			 * they'd otherwise still show a stale VU from before the upload
+			 * paused playback. */
+			static uint32_t upload_blink;
+			upload_blink++;
+			bool on = ((upload_blink / 38) & 1u) == 0;   /* ~320 ms per half-cycle */
+			uint32_t pm = usb_upload_progress_permille();
+			int lit = 1 + (int)(pm * NUM_PB_LEDS / 1000u);
+			if (lit > NUM_PB_LEDS) lit = NUM_PB_LEDS;
+			for (int s = 0; s < NUM_PB_LEDS; s++)
+				pwm1_set_duty(s, (s < lit && on) ? PWM_TOP : 0);
+			for (int s = 0; s < 4; s++)
+				pwm0_set_duty(s, 0);
+		} else if (!s_gesture_active) {
+			for (int s = 0; s < NUM_PB_LEDS; s++) {
+				int b = fill - s * PWM_TOP;
+				if (b < 0)       b = 0;
+				if (b > PWM_TOP) b = PWM_TOP;
+				pwm1_set_duty(NUM_PB_LEDS - 1 - s, (uint16_t)b);
+			}
 
-		/* Track LEDs: per-stem baked level (× fader gain), one-pole smoothed. */
-		for (int s = 0; s < 4; s++) {
-			int target = playing ? (int)audio_stem_level_at(blk, s) * PWM_TOP / 255 : 0;
-			trk_disp[s] += (target - trk_disp[s]) / 2;
-			pwm0_set_duty(s, (uint16_t)trk_disp[s]);
+			/* Track LEDs: per-stem baked level (× fader gain), one-pole smoothed. */
+			for (int s = 0; s < 4; s++) {
+				int target = playing ? (int)audio_stem_level_at(blk, s) * PWM_TOP / 255 : 0;
+				trk_disp[s] += (target - trk_disp[s]) / 2;
+				pwm0_set_duty(s, (uint16_t)trk_disp[s]);
+			}
 		}
 
 		k_msleep(8);
@@ -222,6 +378,18 @@ int main(void)
 	 * often enough for input + the watchdog; the feed yields to it whenever its
 	 * TX alloc blocks. (Nothing else runs yet, so lowering now is safe.) */
 	k_thread_priority_set(k_current_get(), 10);
+
+	/* Captured BEFORE the clear below: true if this boot is a wake from
+	 * SYSTEM_OFF via the function button's SENSE (see enter_system_off). A
+	 * cold boot (fresh flash, battery just connected) never sets this, so the
+	 * hold-to-power-on gate below only applies to the real "device was off,
+	 * function was pressed" case -- it can't lock out a first-ever boot. */
+	bool off_wake = (NRF_POWER->RESETREAS & POWER_RESETREAS_OFF_Msk) != 0;
+
+	/* Clear RESETREAS on boot as well as before SYSTEMOFF: the bootloader reads
+	 * it to decide how it was entered, and stale bits left by a watchdog reset
+	 * or a previous power-off can send it down the wrong path. */
+	NRF_POWER->RESETREAS = 0xFFFFFFFFUL;
 
 	NRF_PPI->CHENCLR = 0xFFFFFFFFUL;
 
@@ -239,10 +407,80 @@ int main(void)
 	saadc_init();
 	pwm0_init();
 	pwm1_init();   /* pb_leds via PWM1 (dimmable) — before any set_pb_on() */
+
+	if (off_wake) {
+		/* Power-ON gate, symmetric with the power-OFF hold: require the
+		 * function button that triggered this wake to still be held for a
+		 * full 3 s before actually booting. Rejects a brief accidental touch
+		 * on the SENSE-armed pin (a bump, a graze in a bag) without ever
+		 * spinning up eMMC/codec/audio for it. All 8 LEDs fill progressively
+		 * as feedback -- the power-on animation. codec_init()/emmc_init()
+		 * have NOT run yet at this point (that's the whole reason this check
+		 * comes first), so there is nothing to power back down if we abort;
+		 * unlike enter_system_off(), no codec_power_down()/emmc_power_down()
+		 * call belongs here. */
+		bool held_full = true;
+		for (int ms = 0; ms < 3000; ms += 20) {
+			if (NRF_P0->IN & (1u << 27)) { held_full = false; break; }  /* released early */
+			int filled = ms * (NUM_PB_LEDS + NUM_TRK_LEDS) / 3000;
+			for (int i = 0; i < NUM_PB_LEDS; i++)
+				pwm1_set_duty(i, (i < filled) ? PWM_TOP : 0);
+			for (int i = 0; i < NUM_TRK_LEDS; i++)
+				pwm0_set_duty(i, (NUM_PB_LEDS + i < filled) ? PWM_TOP : 0);
+			delay_ms(20);
+			feed_wdt();
+		}
+		if (!held_full) {
+			/* Too short to count: clear the LEDs, debounce the release the
+			 * same way enter_system_off() does, then go straight back into
+			 * SYSTEM_OFF with SENSE re-armed. No boot happened. */
+			for (int i = 0; i < NUM_PB_LEDS; i++)  pwm1_set_duty(i, 0);
+			for (int i = 0; i < NUM_TRK_LEDS; i++) pwm0_set_duty(i, 0);
+			for (int i = 0; i < 150 && !(NRF_P0->IN & (1u << 27)); i++) {
+				k_msleep(20);
+				feed_wdt();
+			}
+			k_msleep(60);
+			NRF_P0->LATCH = 0xFFFFFFFFu;
+			NRF_P0->PIN_CNF[27] =
+				(GPIO_PIN_CNF_DIR_Input     << GPIO_PIN_CNF_DIR_Pos)   |
+				(GPIO_PIN_CNF_PULL_Pullup   << GPIO_PIN_CNF_PULL_Pos)  |
+				(GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
+				(GPIO_PIN_CNF_SENSE_Low     << GPIO_PIN_CNF_SENSE_Pos);
+			__DSB();
+			feed_wdt();
+			NRF_POWER->RESETREAS = 0xFFFFFFFFUL;
+			NRF_POWER->SYSTEMOFF = 1;
+			__DSB();
+			for (;;);
+		}
+	}
+
 	usb_cdc_init();
 
-	/* eMMC init: pb_led[0] solid = success.
-	 * On failure: pb_led[1] blinks N times = which init step failed (1-9). */
+	/* Boot animation: a light bounces back and forth across the 4 playback
+	 * LEDs, fading each neighbor for depth. Confirms the device is alive
+	 * before eMMC/codec bring-up even starts — useful on its own, since a
+	 * healthy idle device is otherwise dark by design and easy to mistake for
+	 * dead. The README has claimed this as a shipped feature; nothing ever
+	 * implemented it. ~5 round trips, feeding the watchdog throughout. */
+	for (int step = 0; step < 28; step++) {
+		int pos = step % 6;
+		int lit = (pos <= 3) ? pos : 6 - pos;   /* 0,1,2,3,2,1 -> bounce */
+		for (int i = 0; i < NUM_PB_LEDS; i++) {
+			int dist = i - lit; if (dist < 0) dist = -dist;
+			uint16_t duty = (dist == 0) ? PWM_TOP : (dist == 1) ? PWM_TOP / 6 : 0;
+			pwm1_set_duty(i, duty);
+		}
+		delay_ms(45);
+		feed_wdt();
+	}
+	all_pb_off();
+
+	/* eMMC init. On failure: pb_led[1] blinks N times = which init step failed
+	 * (1-9). On SUCCESS nothing lights — an idle, not-playing device is dark by
+	 * design, so "no LEDs" means healthy, not dead. (This used to claim
+	 * "pb_led[0] solid = success"; no code ever did that.) */
 	if (!emmc_init()) {
 		uint8_t step = emmc_fail_step();
 		for (;;) {
@@ -269,10 +507,20 @@ int main(void)
 	uint32_t song_block_start = 0, song_block_count = 0;
 	uint16_t first_song_idx = 0, total_songs = 0;
 	bool song_found = false;
-	if (disk_read_header(&s_dh) && s_dh.song_count > 0) {
+	bool hdr_valid = disk_read_header(&s_dh);
+	/* Restore saved master volume. settings_magic guards against reading a
+	 * vol_level of 0 from a header written before this field existed (that
+	 * padding was always zeroed by disk_format, so an old header reads
+	 * magic=0 here, not DISK_SETTINGS_MAGIC) -- fall back to the existing
+	 * night-friendly default (s_vol_level's initializer, 3) in that case. */
+	if (hdr_valid && s_dh.settings_magic == DISK_SETTINGS_MAGIC && s_dh.vol_level <= 7)
+		s_vol_level = s_dh.vol_level;
+	if (hdr_valid && s_dh.song_count > 0) {
 		total_songs = s_dh.song_count;
 		for (uint16_t i = 0; i < s_dh.song_count; i++) {
-			if (disk_read_song(i, &s_se) && s_se.name[0] != '\0') {
+			/* Skip zero-length entries too (an upload that never committed):
+			 * loading one starts the feed on the 440 Hz error tone. */
+			if (disk_read_song(i, &s_se) && s_se.name[0] != '\0' && s_se.block_count > 0) {
 				song_found       = true;
 				first_song_idx   = i;
 				song_block_start = s_se.block_start;
@@ -296,18 +544,29 @@ int main(void)
 
 	/* Play button on ladder 1 (AIN0): measured idle≈0, play≈1808, track1≈210.
 	 * Detect a press as a window around 1808; toggle play/pause on the edge. */
-	int play_prev = 0;
+	bool play_prev = false;
 
 	/* Speaker volume: 8 levels (0 = mute … 7 = loud) → TAS2505 P1/R46 attenuation
 	 * (0x00 = 0 dB loudest, larger = quieter). Vol +/- on ladder 2 (AIN1):
 	 * measured idle≈0, vol+≈1806, vol-≈729. Boot at a night-friendly level. */
 	static const uint8_t vol_r46[8] = {0x7F, 0x48, 0x3C, 0x30, 0x24, 0x18, 0x0C, 0x00};
-	int volup_prev = 0;
-	int voldn_prev = 0;
+	bool volup_prev = false;
+	bool voldn_prev = false;
 	int volup_hold = 0;   /* loops a vol button has been held (for auto-repeat) */
 	int voldn_hold = 0;
-	int next_prev  = 0;
-	int prev_prev  = 0;
+	bool next_prev  = false;
+	bool prev_prev  = false;
+
+	/* Debounce state for the 5 ladder-decoded buttons below. Each raw window
+	 * test was previously fed straight into edge detection with NO filtering:
+	 * a single noisy ADC sample flickering across a threshold registered as a
+	 * full press+release for one physical tap ("one click registers as two"),
+	 * and on the rocker the same glitch could fire the skip edge twice for one
+	 * push, which is what made track navigation feel inconsistent. Require 2
+	 * consecutive identical raw reads (main's loop runs fast enough — plain
+	 * SAADC reads plus one I2C jack check — that this costs no perceptible
+	 * input lag) before a button's debounced state is allowed to change. */
+	struct btn_db db_play = {0}, db_volup = {0}, db_voldn = {0}, db_next = {0}, db_prev = {0};
 	/* vol_level + meter_ticks live at file scope (s_vol_level / s_meter_ticks):
 	 * the buttons here write them, the UI thread reads them to render the meter.
 	 * The LED visualizers are drawn by the UI thread, not this loop. */
@@ -334,16 +593,51 @@ int main(void)
 			K_PRIO_PREEMPT(1), 0, K_NO_WAIT);
 	k_thread_name_set(&s_ui_thread, "ui");
 
+	int64_t off_hold_start = 0;   /* 0 = not currently holding function */
+
 	while (1) {
-		if (!(NRF_P0->IN & (1u << 27)))
+		bool uploading = usb_upload_active();
+
+		/* Power off: a host command (rome bootloader's POWER_OFF) fires
+		 * immediately -- it isn't a physical hold, there's nothing to debounce.
+		 * The physical button requires a full 3 s continuous hold, symmetric
+		 * with the power-on gate in main()'s startup: a bare tap used to power
+		 * the device off instantly, which is exactly the kind of accidental
+		 * trigger (bumping it in a pocket, brushing it while reaching for
+		 * play) the hold exists to prevent. All 8 LEDs fill progressively over
+		 * the hold as feedback -- the power-off animation -- and releasing
+		 * early aborts with no effect. Skipped entirely mid-upload either way
+		 * (see the uploading guard below). */
+		if (!uploading && usb_power_off_requested())
 			enter_system_off();
 
-		bool uploading = usb_upload_active();
+		bool fn_down = !(NRF_P0->IN & (1u << 27));
+		if (!uploading && fn_down) {
+			if (off_hold_start == 0) {
+				off_hold_start = k_uptime_get();
+				s_gesture_active = true;   /* claim both LED rows from the UI thread */
+			}
+			int64_t held_ms = k_uptime_get() - off_hold_start;
+			int filled = (int)(held_ms * (NUM_PB_LEDS + NUM_TRK_LEDS) / 3000);
+			if (filled > NUM_PB_LEDS + NUM_TRK_LEDS) filled = NUM_PB_LEDS + NUM_TRK_LEDS;
+			for (int i = 0; i < NUM_PB_LEDS; i++)
+				pwm1_set_duty(i, (i < filled) ? PWM_TOP : 0);
+			for (int i = 0; i < NUM_TRK_LEDS; i++)
+				pwm0_set_duty(i, (NUM_PB_LEDS + i < filled) ? PWM_TOP : 0);
+			if (held_ms >= 3000)
+				enter_system_off();   /* does not return */
+		} else if (off_hold_start != 0) {
+			/* Released before 3 s (or an upload started mid-hold): abort.
+			 * Hand the LEDs back to the UI thread, which repaints its own
+			 * state on its very next ~8 ms tick. */
+			off_hold_start = 0;
+			s_gesture_active = false;
+		}
 
 		/* Play/pause button (edge-triggered) on ladder 1 (AIN0). */
 		int ladder = saadc_read(1u);  /* AIN0 */
 		audio_dbg_set_ain0((uint16_t)ladder);   /* expose for threshold tuning via rome audio */
-		int play_now = (ladder >= 1650 && ladder <= 1980);
+		bool play_now = debounce(ladder >= 1650 && ladder <= 1980, &db_play);
 		if (play_now && !play_prev)
 			audio_toggle();
 		play_prev = play_now;
@@ -352,10 +646,10 @@ int main(void)
 
 		/* Ladder 2 (AIN1): prev≈399, vol-≈729, next≈1207, vol+≈1806. */
 		int vladder = saadc_read(2u);  /* AIN1 */
-		int volup_now = (vladder >= 1620 && vladder <= 1960);
-		int next_now  = (vladder >= 1080 && vladder <= 1340);
-		int voldn_now = (vladder >=  620 && vladder <=  860);
-		int prev_now  = (vladder >=  300 && vladder <=  520);
+		bool volup_now = debounce(vladder >= 1620 && vladder <= 1960, &db_volup);
+		bool next_now  = debounce(vladder >= 1080 && vladder <= 1340, &db_next);
+		bool voldn_now = debounce(vladder >=  620 && vladder <=  860, &db_voldn);
+		bool prev_now  = debounce(vladder >=  300 && vladder <=  520, &db_prev);
 		/* Vol +/- with hold-to-repeat: step once on the press edge, then after a
 		 * short hold (~180 ms) auto-repeat every ~70 ms while held. */
 		enum { VOL_HOLD_DELAY = 10, VOL_HOLD_RATE = 4 };
@@ -376,7 +670,22 @@ int main(void)
 			else        codec_speaker_volume(vol_r46[s_vol_level]);
 			s_meter_ticks = 120;   /* ~1 s of volume bar at the UI thread's 8 ms tick */
 		}
-		/* Prev/next rocker: skip song + ensure playing. */
+		/* Persist volume on RELEASE, not per step: a held vol button auto-repeats
+		 * every ~70 ms, and writing eMMC that often would wear the card for no
+		 * benefit (only the final level after a gesture matters) and contend
+		 * the bus with the feed thread during playback. One write per gesture. */
+		if ((volup_prev && !volup_now) || (voldn_prev && !voldn_now))
+			g_settings_dirty = true;
+
+		if (g_settings_dirty && !uploading)
+			settings_flush();
+		/* Prev/next rocker: skip song + ensure playing. Wraparound to/from the
+		 * ends is already handled inside audio_skip -> change_song, which walks
+		 * with modulo arithmetic (next past the last song lands on song 0, prev
+		 * before song 0 lands on the last song) -- the debounce above is what
+		 * was actually broken: an undebounced glitch could fire this edge twice
+		 * for one physical push, silently skipping two tracks instead of one
+		 * and making navigation feel inconsistent. */
 		if (next_now && !next_prev) { audio_skip(1);  audio_play(); }
 		if (prev_now && !prev_prev) { audio_skip(-1); audio_play(); }
 		volup_prev = volup_now;

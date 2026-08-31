@@ -41,6 +41,26 @@ uint32_t emmc_busy_us(void);         /* µs in busy-wait of last written block *
 /* Flush eMMC write cache to NAND (call after upload before power-off). */
 bool emmc_cache_flush(void);
 
+/* Flush the write cache, release the bus pins and drop the VCCQ I/O rail for
+ * SYSTEM_OFF. Without this the card's I/O rail stays powered off retained GPIO
+ * levels and drains the battery while the nRF is asleep. */
+void emmc_power_down(void);
+
+/*
+ * Claim the eMMC bus across several calls. Every emmc_* entry point already
+ * takes this internally; these let a caller make a multi-call sequence atomic
+ * (disk.c's catalog read-modify-write). Recursive for the owning thread, so
+ * nesting an emmc_* call inside is free. Must be balanced.
+ *
+ * This is deliberately the ONLY lock in the eMMC/disk layer. An earlier version
+ * gave disk.c its own mutex, which deadlocked: the feed thread took the disk
+ * lock then waited on the bus lock, while the upload held the bus lock for the
+ * whole CMD25 session and then waited on the disk lock at SONG_COMMIT. Neither
+ * thread fed the watchdog. One lock cannot invert against itself.
+ */
+void emmc_bus_lock(void);
+void emmc_bus_unlock(void);
+
 /* Read num_blocks consecutive 512-byte blocks starting at block_addr.
  * buf must hold num_blocks * 512 bytes and be 4-byte aligned. */
 bool emmc_read_blocks(uint32_t block_addr, uint8_t *buf, uint32_t num_blocks);
