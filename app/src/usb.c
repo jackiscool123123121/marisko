@@ -112,7 +112,7 @@ typedef struct {
 static upload_t    g_upload;
 static disk_header_t g_hdr;
 static bool        g_hdr_cached;
-static uint8_t     g_ul_fail;       /* 0=none 1=usb-read-timeout 2=write-fail */
+static uint8_t     g_ul_fail;       /* 0=none 1=usb-read-timeout 2=resp-reject 3=busy-timeout 4=unknown-write-fail */
 static uint32_t    g_ul_fail_block; /* block index where it failed */
 
 static bool ensure_hdr(void)
@@ -329,8 +329,25 @@ static void handle_song_multiblock(const uint8_t *count_payload, uint32_t plen)
 			g_ul_fail = 1; g_ul_fail_block = g_upload.blocks_written; ok = false; break;
 		}
 		feed_wdt();
+
 		if (!emmc_write_multi_block(s_block_buf)) {
-			g_ul_fail = 2; g_ul_fail_block = g_upload.blocks_written; ok = false; break;
+			/* Diagnostic only -- NOT retried. The 515-byte SPIM burst for this
+			 * block has ALREADY been fully transmitted to the card by the time
+			 * a rejection is even detected (spim_xfer happens unconditionally,
+			 * before the status-token read). Blindly resending the same block
+			 * into an ongoing CMD25 stream is not verified safe: the card may
+			 * treat the resend as the NEXT sequential block rather than a
+			 * retry of the rejected one, silently shifting every block after
+			 * it by one position -- an upload that reports success but wrote
+			 * corrupted audio, which is worse than a clean failure. Distinct
+			 * fail codes (was a single collapsed "2=write-fail") so the next
+			 * failure says exactly which failure mode it was instead of
+			 * leaving it a guess: 2=resp-reject, 3=busy-timeout, 4=unknown. */
+			uint8_t mbf = emmc_mb_fail();
+			g_ul_fail = (mbf == 1) ? 2 : (mbf == 2) ? 3 : 4;
+			g_ul_fail_block = g_upload.blocks_written;
+			ok = false;
+			break;
 		}
 		g_upload.blocks_written++;
 	}

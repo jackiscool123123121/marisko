@@ -54,17 +54,29 @@ static void settings_flush(void)
 		g_settings_dirty = false;
 }
 
-/* 2-consecutive-reads debounce for a ladder-window test. See the comment on
- * the btn_db block in main() for why this exists. */
+/* Up/down integrator debounce for a ladder-window test. See the comment on
+ * the btn_db block in main() for why this exists.
+ *
+ * The first version of this required 2 CONSECUTIVE IDENTICAL raw reads before
+ * accepting any change -- a single flicker anywhere in the run (raw ladder
+ * values sitting near a threshold WILL occasionally read one sample on the
+ * wrong side even during a genuine, sustained press) reset the counter to
+ * zero, and it could then need many samples before two happened to land back
+ * to back. On real hardware this made most presses fail to register at all
+ * ("only pauses about a quarter of the time") rather than merely allowing an
+ * occasional double-fire, which was the ORIGINAL bug this was meant to fix.
+ *
+ * An up/down counter tolerates that: each read nudges the count by one step
+ * toward its own reading rather than resetting on disagreement, so one stray
+ * sample mid-press costs a single step of delay, not the whole count. A
+ * lone, truly transient glitch (the case this exists to reject) still can't
+ * reach the threshold on its own from a stable opposite baseline. */
 static bool debounce(bool raw, struct btn_db *b)
 {
-	if (raw == b->raw_prev) {
-		if (b->cnt < 2) b->cnt++;
-	} else {
-		b->raw_prev = raw;
-		b->cnt = 0;
-	}
-	if (b->cnt >= 2) b->stable = raw;
+	if (raw) { if (b->cnt < 3) b->cnt++; }
+	else     { if (b->cnt > 0) b->cnt--; }
+	if (b->cnt >= 3)      b->stable = true;
+	else if (b->cnt == 0) b->stable = false;
 	return b->stable;
 }
 
@@ -274,14 +286,19 @@ static void ui_main(void *a, void *b, void *c)
 		/* Track buttons on AIN0 → bitmask of held stems. Tap toggles them; a
 		 * hold >250 ms solos them, and the solo set follows the held buttons
 		 * live (add/remove a finger to change it). */
+		/* Same up/down-integrator fix as debounce() in main() (see its
+		 * comment): a disagreeing sample DRAINS the count by one instead of
+		 * resetting it to zero and restarting from the new value. Only once
+		 * the count fully drains to 0 does the candidate actually switch --
+		 * so one stray misread mid-hold costs a step, not the whole count. */
 		uint8_t raw_mask = track_mask(saadc_read(1u));
 		if (raw_mask == trk_pending) {
-			if (trk_pend_cnt < 250) trk_pend_cnt++;
+			if (trk_pend_cnt < 3) trk_pend_cnt++;
 		} else {
-			trk_pending = raw_mask;
-			trk_pend_cnt = 1;
+			if (trk_pend_cnt > 0) trk_pend_cnt--;
+			if (trk_pend_cnt == 0) trk_pending = raw_mask;
 		}
-		if (trk_pend_cnt >= 2) trk_stable = trk_pending;
+		if (trk_pend_cnt >= 3) trk_stable = trk_pending;
 		uint8_t cur = trk_stable;
 		if (cur) {
 			if (!trk_held) { trk_press_ms = k_uptime_get(); trk_soloed = false; trk_held = true; }
@@ -463,8 +480,10 @@ int main(void)
 	 * before eMMC/codec bring-up even starts — useful on its own, since a
 	 * healthy idle device is otherwise dark by design and easy to mistake for
 	 * dead. The README has claimed this as a shipped feature; nothing ever
-	 * implemented it. ~5 round trips, feeding the watchdog throughout. */
-	for (int step = 0; step < 28; step++) {
+	 * implemented it. 2 round trips at 30 ms/step (~360 ms total) -- long
+	 * enough to read as a deliberate animation, short enough not to feel like
+	 * a delay before the device is usable. Feeds the watchdog throughout. */
+	for (int step = 0; step < 12; step++) {
 		int pos = step % 6;
 		int lit = (pos <= 3) ? pos : 6 - pos;   /* 0,1,2,3,2,1 -> bounce */
 		for (int i = 0; i < NUM_PB_LEDS; i++) {
@@ -472,7 +491,7 @@ int main(void)
 			uint16_t duty = (dist == 0) ? PWM_TOP : (dist == 1) ? PWM_TOP / 6 : 0;
 			pwm1_set_duty(i, duty);
 		}
-		delay_ms(45);
+		delay_ms(30);
 		feed_wdt();
 	}
 	all_pb_off();
@@ -677,7 +696,19 @@ int main(void)
 		if ((volup_prev && !volup_now) || (voldn_prev && !voldn_now))
 			g_settings_dirty = true;
 
-		if (g_settings_dirty && !uploading)
+		/* Never flush while actively playing: this codebase already has an
+		 * established rule that disk header/catalog writes pause audio first
+		 * (see usb.c's SONG_BEGIN etc.) -- settings_flush() broke it. Both
+		 * calls it makes (disk_read_header, disk_write_header) are the
+		 * bit-banged single-block CMD17/CMD24 path, which shares the SAME
+		 * eMMC bus lock the feed thread needs for its own real-time prefetch
+		 * reads; contending for it here caused audible stutters during
+		 * playback. Deferred until paused (or power-off, which flushes
+		 * unconditionally in enter_system_off() -- fine there, since audio is
+		 * already being torn down at that point). The setting isn't lost by
+		 * waiting: g_settings_dirty just stays set until the next moment
+		 * that's actually safe. */
+		if (g_settings_dirty && !uploading && !audio_is_playing())
 			settings_flush();
 		/* Prev/next rocker: skip song + ensure playing. Wraparound to/from the
 		 * ends is already handled inside audio_skip -> change_song, which walks
@@ -734,9 +765,12 @@ int main(void)
 		feed_wdt();
 		if (!uploading)
 			k_msleep(playing ? 18 : 30);   /* faster while playing → smoother VU */
-
-		if (!(NRF_P0->IN & (1u << 27)))
-			enter_system_off();
+		/* Power-off is handled once, at the TOP of this loop, via the 3 s hold
+		 * gate + animation. A second, unconditional "!(NRF_P0->IN & bit27) ->
+		 * enter_system_off()" check used to live here too (predating the hold
+		 * gate) -- it fired on the very first loop tick the button read low,
+		 * bypassing the hold entirely and powering off almost instantly, which
+		 * is why the animation never had time to show. Removed. */
 	}
 
 	return 0;
