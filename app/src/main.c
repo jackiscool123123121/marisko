@@ -16,9 +16,25 @@ struct btn_db { bool raw_prev, stable; uint8_t cnt; };
 /* Current 0..7 master volume level, and whether it's changed since the last
  * disk write. Declared here (not next to s_meter_ticks below, where this used
  * to live) because settings_flush() -- used by enter_system_off(), which sits
- * above the rest of main()'s UI state -- needs both in scope first. */
+ * above the rest of main()'s UI state -- needs both in scope first.
+ *
+ * g_settings_dirty is volatile: it's now set by the UI thread (on a vol +/-
+ * release, once that polling moved there -- see the big comment on ui_main
+ * about why) and read/cleared by main(), which is the only thread allowed to
+ * actually touch eMMC for it (see settings_flush's own comment). */
 static volatile int s_vol_level = 3;
-static bool g_settings_dirty;
+static volatile bool g_settings_dirty;
+
+/* Speaker volume: 8 levels (0 = mute … 7 = loud) → TAS2505 P1/R46 attenuation
+ * (0x00 = 0 dB loudest, larger = quieter). File scope: both main() (jack-sense
+ * switch) and ui_main() (vol +/- button) apply it. */
+static const uint8_t vol_r46[8] = {0x7F, 0x48, 0x3C, 0x30, 0x24, 0x18, 0x0C, 0x00};
+
+/* Output routing: speaker (TAS2505) or headphones (CS42L42) -- exactly one is
+ * unmuted at a time. Written by main()'s jack-sense polling, read by
+ * ui_main()'s vol +/- handling to know which codec path to adjust. volatile
+ * for that cross-thread visibility (same reasoning as g_settings_dirty). */
+static volatile bool s_hp_out;
 
 /* On any fatal error (incl. stack-overflow fault with HW_STACK_PROTECTION):
  * light all 8 LEDs solid and feed the WDT forever, so a crash is visible. */
@@ -231,13 +247,41 @@ static struct k_thread s_ui_thread;
  * Runs ABOVE the audio feed thread so it preempts the feed's long eMMC reads —
  * the faders and the meters stay real-time instead of freezing in ~68 ms chunks
  * (which is what happened when this ran in the read-starved main thread). Its
- * per-tick work is ~0.2 ms, a blip the deep TX queue absorbs. */
+ * per-tick work is ~0.2 ms, a blip the deep TX queue absorbs.
+ *
+ * Play/pause, vol +/-, and the prev/next rocker are ALSO handled here now, not
+ * in main()'s loop, for the exact same reason track buttons already were (see
+ * the comment below on trk_held): main() runs at priority 10, BELOW the audio
+ * feed thread (priority 5). During active playback the feed thread does an
+ * UNINTERRUPTIBLE ~20-40 ms bit-banged eMMC burst read roughly every ~170 ms,
+ * and since it is higher priority, main() cannot run AT ALL during that
+ * window -- it is not slowed down, it is completely starved. A short press
+ * that lands inside one of those windows is invisible to main() no matter how
+ * it is debounced. This is exactly why track buttons were already polled here
+ * instead of in main() -- but play/pause sits on the SAME AIN0 ladder as the
+ * track buttons and was never moved, which is why "play is instant, pause
+ * needs a deliberate hold" was reported: pausing only happens while ALREADY
+ * playing, i.e. only while this starvation is actually happening; a plain
+ * press from paused (feed thread doing near-nothing, no bursts) never hit it.
+ * ui_main runs at priority 1, ABOVE the feed thread, so it is immune. */
 static void ui_main(void *a, void *b, void *c)
 {
 	(void)a; (void)b; (void)c;
 	/* saadc pselp per fader (= AIN+1): F1=AIN3=4 (stem0), F2=AIN6=7 (stem1),
 	 * F3=AIN2=3 (stem2), F4=AIN7=8 (stem3). */
 	static const uint8_t fader_ch[4] = {4u, 7u, 3u, 8u};
+	bool    play_prev   = false;
+	bool    volup_prev  = false;
+	bool    voldn_prev  = false;
+	bool    next_prev   = false;
+	bool    prev_prev   = false;
+	/* Hold-to-repeat timing for vol +/-, in wall-clock ms rather than tick
+	 * counts (matching trk_press_ms's own pattern below) so it stays correct
+	 * regardless of this thread's actual tick cadence -- tick-counted repeat
+	 * rates silently drift if the loop's k_msleep ever changes. */
+	int64_t volup_press_ms = 0, voldn_press_ms = 0;
+	int64_t volup_repeat_ms = 0, voldn_repeat_ms = 0;
+	struct btn_db db_play = {0}, db_volup = {0}, db_voldn = {0}, db_next = {0}, db_prev = {0};
 	int vu_disp = 0;
 	int trk_disp[4] = {0, 0, 0, 0};
 	/* Smooth real-time playback position for the meters. The feed thread's
@@ -291,7 +335,9 @@ static void ui_main(void *a, void *b, void *c)
 		 * resetting it to zero and restarting from the new value. Only once
 		 * the count fully drains to 0 does the candidate actually switch --
 		 * so one stray misread mid-hold costs a step, not the whole count. */
-		uint8_t raw_mask = track_mask(saadc_read(1u));
+		int ain0 = saadc_read(1u);
+		audio_dbg_set_ain0((uint16_t)ain0);   /* expose for threshold tuning via rome audio */
+		uint8_t raw_mask = track_mask(ain0);
 		if (raw_mask == trk_pending) {
 			if (trk_pend_cnt < 3) trk_pend_cnt++;
 		} else {
@@ -314,6 +360,73 @@ static void ui_main(void *a, void *b, void *c)
 			}
 			trk_held = false;
 		}
+
+		/* Play/pause button on the SAME AIN0 ladder as the track buttons above
+		 * -- reuse that read rather than sampling AIN0 twice. Window per the
+		 * original main()-loop code: idle≈0, play≈1808, track1≈210. */
+		bool play_now = debounce(ain0 >= 1650 && ain0 <= 1980, &db_play);
+		if (play_now && !play_prev)
+			audio_toggle();
+		play_prev = play_now;
+
+		/* Ladder 2 (AIN1): prev≈399, vol-≈729, next≈1207, vol+≈1806. */
+		int ain1 = saadc_read(2u);
+		audio_dbg_set_ain1((uint16_t)ain1);   /* expose for threshold tuning via rome audio */
+		bool volup_now = debounce(ain1 >= 1620 && ain1 <= 1960, &db_volup);
+		bool next_now  = debounce(ain1 >= 1080 && ain1 <= 1340, &db_next);
+		bool voldn_now = debounce(ain1 >=  620 && ain1 <=  860, &db_voldn);
+		bool prev_now  = debounce(ain1 >=  300 && ain1 <=  520, &db_prev);
+
+		/* Vol +/- with hold-to-repeat: step once on the press edge, then after a
+		 * ~180 ms hold, auto-repeat every ~70 ms while held. Wall-clock based
+		 * (k_uptime_get), not tick-counted, so it stays correct regardless of
+		 * this thread's actual loop cadence -- see trk_press_ms above for the
+		 * same pattern already used for the track-button solo hold. */
+		int vol_step = 0;
+		int64_t vol_now_ms = k_uptime_get();
+		if (volup_now) {
+			if (!volup_prev) {
+				volup_press_ms = volup_repeat_ms = vol_now_ms;
+				vol_step = 1;
+			} else if (vol_now_ms - volup_press_ms > 180 && vol_now_ms - volup_repeat_ms > 70) {
+				volup_repeat_ms = vol_now_ms;
+				vol_step = 1;
+			}
+		}
+		if (voldn_now) {
+			if (!voldn_prev) {
+				voldn_press_ms = voldn_repeat_ms = vol_now_ms;
+				vol_step = -1;
+			} else if (vol_now_ms - voldn_press_ms > 180 && vol_now_ms - voldn_repeat_ms > 70) {
+				voldn_repeat_ms = vol_now_ms;
+				vol_step = -1;
+			}
+		}
+		if (vol_step > 0 && s_vol_level < 7) s_vol_level++;
+		else if (vol_step < 0 && s_vol_level > 0) s_vol_level--;
+		else vol_step = 0;
+		if (vol_step != 0) {
+			if (s_hp_out) hp_apply_level(s_vol_level);
+			else          codec_speaker_volume(vol_r46[s_vol_level]);
+			s_meter_ticks = 120;   /* ~1 s of volume bar at this thread's 8 ms tick */
+		}
+		/* Persist volume on RELEASE, not per step: a held vol button auto-repeats
+		 * every ~70 ms, and writing eMMC that often would wear the card for no
+		 * benefit (only the final level after a gesture matters) and contend the
+		 * bus with the feed thread during playback. One write per gesture. main()
+		 * owns the actual disk write (see its comment); this just raises the flag. */
+		if ((volup_prev && !volup_now) || (voldn_prev && !voldn_now))
+			g_settings_dirty = true;
+
+		/* Prev/next rocker: skip song + ensure playing. Wraparound to/from the
+		 * ends is handled inside audio_skip -> change_song (modulo arithmetic in
+		 * audio.c), not here. */
+		if (next_now && !next_prev) { audio_skip(1);  audio_play(); }
+		if (prev_now && !prev_prev) { audio_skip(-1); audio_play(); }
+		volup_prev = volup_now;
+		voldn_prev = voldn_now;
+		next_prev  = next_now;
+		prev_prev  = prev_now;
 
 		/* Fold in stem on/off + solo: while any stem is soloed, only soloed stems
 		 * play; otherwise muted stems are silenced. Fader gain is the base. */
@@ -579,43 +692,20 @@ int main(void)
 	}
 	feed_wdt();
 
-	/* Play button on ladder 1 (AIN0): measured idle≈0, play≈1808, track1≈210.
-	 * Detect a press as a window around 1808; toggle play/pause on the edge. */
-	bool play_prev = false;
-
-	/* Speaker volume: 8 levels (0 = mute … 7 = loud) → TAS2505 P1/R46 attenuation
-	 * (0x00 = 0 dB loudest, larger = quieter). Vol +/- on ladder 2 (AIN1):
-	 * measured idle≈0, vol+≈1806, vol-≈729. Boot at a night-friendly level. */
-	static const uint8_t vol_r46[8] = {0x7F, 0x48, 0x3C, 0x30, 0x24, 0x18, 0x0C, 0x00};
-	bool volup_prev = false;
-	bool voldn_prev = false;
-	int volup_hold = 0;   /* loops a vol button has been held (for auto-repeat) */
-	int voldn_hold = 0;
-	bool next_prev  = false;
-	bool prev_prev  = false;
-
-	/* Debounce state for the 5 ladder-decoded buttons below. Each raw window
-	 * test was previously fed straight into edge detection with NO filtering:
-	 * a single noisy ADC sample flickering across a threshold registered as a
-	 * full press+release for one physical tap ("one click registers as two"),
-	 * and on the rocker the same glitch could fire the skip edge twice for one
-	 * push, which is what made track navigation feel inconsistent. Require 2
-	 * consecutive identical raw reads (main's loop runs fast enough — plain
-	 * SAADC reads plus one I2C jack check — that this costs no perceptible
-	 * input lag) before a button's debounced state is allowed to change. */
-	struct btn_db db_play = {0}, db_volup = {0}, db_voldn = {0}, db_next = {0}, db_prev = {0};
-	/* vol_level + meter_ticks live at file scope (s_vol_level / s_meter_ticks):
-	 * the buttons here write them, the UI thread reads them to render the meter.
-	 * The LED visualizers are drawn by the UI thread, not this loop. */
+	/* Play/pause, vol +/-, and the prev/next rocker are polled in ui_main(),
+	 * not here -- see the big comment there for why. Jack-sense stays in this
+	 * loop (I2C is inherently slow and the switch itself is already debounced
+	 * over multiple seconds of contact bounce, so starvation from the feed
+	 * thread is not a practical problem for it the way it was for buttons). */
 
 	/* Output routing: speaker (TAS2505) or headphones (CS42L42), chosen by the
 	 * CS42L42 jack-sense. Exactly one is unmuted. Debounce jack reads so a noisy
 	 * insert doesn't flap. Detect the initial state before the loop so booting
 	 * with headphones in starts on the right output. */
-	bool hp_out = codec_headphones_present();
-	int  hp_raw_prev = hp_out ? 1 : 0;   /* last raw jack read */
+	s_hp_out = codec_headphones_present();
+	int  hp_raw_prev = s_hp_out ? 1 : 0;   /* last raw jack read */
 	int  hp_debounce = 0;                /* consecutive stable raw reads */
-	if (hp_out) {
+	if (s_hp_out) {
 		codec_speaker_mute(true);
 		hp_apply_level(s_vol_level);
 	} else {
@@ -671,80 +761,19 @@ int main(void)
 			s_gesture_active = false;
 		}
 
-		/* Play/pause button (edge-triggered) on ladder 1 (AIN0). */
-		int ladder = saadc_read(1u);  /* AIN0 */
-		audio_dbg_set_ain0((uint16_t)ladder);   /* expose for threshold tuning via rome audio */
-		bool play_now = debounce(ladder >= 1650 && ladder <= 1980, &db_play);
-		if (play_now && !play_prev)
-			audio_toggle();
-		play_prev = play_now;
-		/* Track buttons (same AIN0 ladder) are sensed in the UI thread so quick
-		 * taps aren't dropped while main is starved during eMMC reads. */
-
-		/* Ladder 2 (AIN1): prev≈399, vol-≈729, next≈1207, vol+≈1806. */
-		int vladder = saadc_read(2u);  /* AIN1 */
-		audio_dbg_set_ain1((uint16_t)vladder);   /* expose for threshold tuning via rome audio */
-		bool volup_now = debounce(vladder >= 1620 && vladder <= 1960, &db_volup);
-		bool next_now  = debounce(vladder >= 1080 && vladder <= 1340, &db_next);
-		bool voldn_now = debounce(vladder >=  620 && vladder <=  860, &db_voldn);
-		bool prev_now  = debounce(vladder >=  300 && vladder <=  520, &db_prev);
-		/* Vol +/- with hold-to-repeat: step once on the press edge, then after a
-		 * short hold (~180 ms) auto-repeat every ~70 ms while held. */
-		enum { VOL_HOLD_DELAY = 10, VOL_HOLD_RATE = 4 };
-		int vol_step = 0;
-		if (volup_now) {
-			if (!volup_prev) { volup_hold = 0; vol_step = 1; }
-			else if (++volup_hold >= VOL_HOLD_DELAY && volup_hold % VOL_HOLD_RATE == 0) vol_step = 1;
-		} else volup_hold = 0;
-		if (voldn_now) {
-			if (!voldn_prev) { voldn_hold = 0; vol_step = -1; }
-			else if (++voldn_hold >= VOL_HOLD_DELAY && voldn_hold % VOL_HOLD_RATE == 0) vol_step = -1;
-		} else voldn_hold = 0;
-		if (vol_step > 0 && s_vol_level < 7) s_vol_level++;
-		else if (vol_step < 0 && s_vol_level > 0) s_vol_level--;
-		else vol_step = 0;
-		if (vol_step != 0) {
-			if (hp_out) hp_apply_level(s_vol_level);
-			else        codec_speaker_volume(vol_r46[s_vol_level]);
-			s_meter_ticks = 120;   /* ~1 s of volume bar at the UI thread's 8 ms tick */
-		}
-		/* Persist volume on RELEASE, not per step: a held vol button auto-repeats
-		 * every ~70 ms, and writing eMMC that often would wear the card for no
-		 * benefit (only the final level after a gesture matters) and contend
-		 * the bus with the feed thread during playback. One write per gesture. */
-		if ((volup_prev && !volup_now) || (voldn_prev && !voldn_now))
-			g_settings_dirty = true;
-
-		/* Never flush while actively playing: this codebase already has an
-		 * established rule that disk header/catalog writes pause audio first
-		 * (see usb.c's SONG_BEGIN etc.) -- settings_flush() broke it. Both
-		 * calls it makes (disk_read_header, disk_write_header) are the
-		 * bit-banged single-block CMD17/CMD24 path, which shares the SAME
-		 * eMMC bus lock the feed thread needs for its own real-time prefetch
-		 * reads; contending for it here caused audible stutters during
-		 * playback. Deferred until paused (or power-off, which flushes
-		 * unconditionally in enter_system_off() -- fine there, since audio is
-		 * already being torn down at that point). The setting isn't lost by
-		 * waiting: g_settings_dirty just stays set until the next moment
-		 * that's actually safe. */
+		/* Play/pause, vol +/-, and the rocker used to be polled here; moved to
+		 * ui_main() (see its comment). settings_flush() stays here -- it does
+		 * eMMC I/O and must never run from the UI thread (the highest-priority
+		 * thread besides none; a blocking eMMC op there would starve the audio
+		 * feed thread itself, a worse version of the exact problem this whole
+		 * change fixes). ui_main sets g_settings_dirty on a vol release; this
+		 * just watches for it. */
 		if (g_settings_dirty && !uploading && !audio_is_playing())
 			settings_flush();
-		/* Prev/next rocker: skip song + ensure playing. Wraparound to/from the
-		 * ends is already handled inside audio_skip -> change_song, which walks
-		 * with modulo arithmetic (next past the last song lands on song 0, prev
-		 * before song 0 lands on the last song) -- the debounce above is what
-		 * was actually broken: an undebounced glitch could fire this edge twice
-		 * for one physical push, silently skipping two tracks instead of one
-		 * and making navigation feel inconsistent. */
-		if (next_now && !next_prev) { audio_skip(1);  audio_play(); }
-		if (prev_now && !prev_prev) { audio_skip(-1); audio_play(); }
-		volup_prev = volup_now;
-		voldn_prev = voldn_now;
-		next_prev  = next_now;
-		prev_prev  = prev_now;
 
-		/* (Faders + both LED visualizers are handled by the UI thread so they
-		 * stay real-time during the feed thread's long eMMC reads.) */
+		/* (Faders, track buttons, and both LED visualizers are handled by the
+		 * UI thread so they stay real-time during the feed thread's long eMMC
+		 * reads.) */
 
 		/* Headphone jack sense (every loop ≈ every 18 ms; the I2C read is cheap).
 		 * Debounce: 2 stable raw reads before flipping output, so a noisy insert
@@ -759,9 +788,9 @@ int main(void)
 				hp_debounce = 0;
 				hp_raw_prev = hp_raw;
 			}
-			if (hp_debounce >= 2 && hp_raw != (hp_out ? 1 : 0)) {
-				hp_out = hp_raw;
-				if (hp_out) {
+			if (hp_debounce >= 2 && hp_raw != (s_hp_out ? 1 : 0)) {
+				s_hp_out = hp_raw;
+				if (s_hp_out) {
 					codec_speaker_mute(true);
 					hp_apply_level(s_vol_level);
 				} else {
