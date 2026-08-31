@@ -9,6 +9,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/sys/ring_buffer.h>
+#include <string.h>
 
 static const struct device *cdc_dev;
 
@@ -331,19 +332,57 @@ static void handle_song_multiblock(const uint8_t *count_payload, uint32_t plen)
 		feed_wdt();
 
 		if (!emmc_write_multi_block(s_block_buf)) {
-			/* Diagnostic only -- NOT retried. The 515-byte SPIM burst for this
-			 * block has ALREADY been fully transmitted to the card by the time
-			 * a rejection is even detected (spim_xfer happens unconditionally,
-			 * before the status-token read). Blindly resending the same block
-			 * into an ongoing CMD25 stream is not verified safe: the card may
-			 * treat the resend as the NEXT sequential block rather than a
-			 * retry of the rejected one, silently shifting every block after
-			 * it by one position -- an upload that reports success but wrote
-			 * corrupted audio, which is worse than a clean failure. Distinct
-			 * fail codes (was a single collapsed "2=write-fail") so the next
-			 * failure says exactly which failure mode it was instead of
-			 * leaving it a guess: 2=resp-reject, 3=busy-timeout, 4=unknown. */
+			/* Real-hardware evidence (rome dump) showed the "rejected" block
+			 * was actually written CORRECTLY -- valid, coherent ADPCM data,
+			 * byte-for-byte matching what was sent. So the response-token scan
+			 * is producing a false negative on this card at least sometimes;
+			 * the write itself is fine. Blindly RESENDING the block would
+			 * still be unsafe (see below), but we don't need to resend
+			 * anything if it's already there: close the session cleanly, read
+			 * the block back, and compare. If it matches, this was a false
+			 * alarm -- count it as written and reopen a fresh session for
+			 * everything after it. Only a genuine MISMATCH is treated as a
+			 * real failure.
+			 *
+			 * (Why not just retry the send instead of verifying: the 515-byte
+			 * SPIM burst for this block has ALREADY been fully transmitted to
+			 * the card by the time a rejection is even detected -- spim_xfer
+			 * happens unconditionally, before the status-token read. Blindly
+			 * resending into an ongoing CMD25 stream is not verified safe,
+			 * since the card may treat the resend as the NEXT sequential
+			 * block rather than a retry of this one, silently shifting every
+			 * block after it by one position. Verifying what's already there
+			 * sidesteps that risk entirely -- nothing is ever resent.) */
 			uint8_t mbf = emmc_mb_fail();
+			uint32_t failed_block = g_upload.block_start + g_upload.blocks_written;
+
+			emmc_write_multi_end();
+			g_upload.multi_begun = false;
+
+			static uint8_t s_verify_buf[512];
+			bool verified = emmc_read_block(failed_block, s_verify_buf) &&
+			                memcmp(s_verify_buf, s_block_buf, 512) == 0;
+
+			if (verified) {
+				g_upload.blocks_written++;
+				uint32_t remaining = g_upload.blocks_expected - g_upload.blocks_written;
+				if (remaining > 0) {
+					if (!emmc_write_multi_begin(g_upload.block_start + g_upload.blocks_written,
+					                             remaining)) {
+						g_ul_fail = (mbf == 1) ? 2 : (mbf == 2) ? 3 : 4;
+						g_ul_fail_block = g_upload.blocks_written;
+						ok = false;
+						break;
+					}
+					g_upload.multi_begun = true;
+				}
+				continue;   /* proceed to the next block in this batch */
+			}
+
+			/* Genuine mismatch/failure. Distinct fail codes (was a single
+			 * collapsed "2=write-fail") so this says exactly which failure
+			 * mode it was instead of leaving it a guess: 2=resp-reject,
+			 * 3=busy-timeout, 4=unknown. */
 			g_ul_fail = (mbf == 1) ? 2 : (mbf == 2) ? 3 : 4;
 			g_ul_fail_block = g_upload.blocks_written;
 			ok = false;
@@ -358,6 +397,17 @@ static void handle_song_multiblock(const uint8_t *count_payload, uint32_t plen)
 		emmc_write_multi_end();
 		g_upload.multi_begun = false;
 		g_upload.active = false;
+		/* SONG_BEGIN already wrote a catalog entry with the FULL declared
+		 * block_count, optimistically, before any data was confirmed written
+		 * -- a genuine (non-recovered) failure here otherwise leaves that
+		 * entry claiming a complete song of the full size while only
+		 * g_upload.blocks_written blocks of it actually exist on disk. Left
+		 * as-is, `rome info` lists it as a normal song and playing it would
+		 * read past written data into whatever was there before (leftover
+		 * bytes from a prior song, or unformatted noise). Mark it deleted --
+		 * same effect as `rome song rm` -- so a failed upload never leaves a
+		 * playable-looking entry that isn't actually complete. */
+		disk_remove_song(g_upload.song_idx);
 		send_err();
 		uint32_t quiet = 0;
 		while (quiet < 10) {   /* ~100 ms of continuous silence */

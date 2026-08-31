@@ -73,9 +73,9 @@ static void settings_flush(void)
  * reach the threshold on its own from a stable opposite baseline. */
 static bool debounce(bool raw, struct btn_db *b)
 {
-	if (raw) { if (b->cnt < 3) b->cnt++; }
+	if (raw) { if (b->cnt < 2) b->cnt++; }
 	else     { if (b->cnt > 0) b->cnt--; }
-	if (b->cnt >= 3)      b->stable = true;
+	if (b->cnt >= 2)      b->stable = true;
 	else if (b->cnt == 0) b->stable = false;
 	return b->stable;
 }
@@ -665,6 +665,7 @@ int main(void)
 
 		/* Ladder 2 (AIN1): prev≈399, vol-≈729, next≈1207, vol+≈1806. */
 		int vladder = saadc_read(2u);  /* AIN1 */
+		audio_dbg_set_ain1((uint16_t)vladder);   /* expose for threshold tuning via rome audio */
 		bool volup_now = debounce(vladder >= 1620 && vladder <= 1960, &db_volup);
 		bool next_now  = debounce(vladder >= 1080 && vladder <= 1340, &db_next);
 		bool voldn_now = debounce(vladder >=  620 && vladder <=  860, &db_voldn);
