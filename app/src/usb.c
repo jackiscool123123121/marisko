@@ -332,61 +332,80 @@ static void handle_song_multiblock(const uint8_t *count_payload, uint32_t plen)
 		feed_wdt();
 
 		if (!emmc_write_multi_block(s_block_buf)) {
-			/* Real-hardware evidence (rome dump) showed the "rejected" block
-			 * was actually written CORRECTLY -- valid, coherent ADPCM data,
-			 * byte-for-byte matching what was sent. So the response-token scan
-			 * is producing a false negative on this card at least sometimes;
-			 * the write itself is fine. Blindly RESENDING the block would
-			 * still be unsafe (see below), but we don't need to resend
-			 * anything if it's already there: close the session cleanly, read
-			 * the block back, and compare. If it matches, this was a false
-			 * alarm -- count it as written and reopen a fresh session for
-			 * everything after it. Only a genuine MISMATCH is treated as a
-			 * real failure.
+			/* Real-hardware evidence: on a card that fails this exact song at
+			 * relative block 11616 every time on the old (verify-less) code,
+			 * adding the verify-and-continue recovery below moved the FINAL
+			 * failure point to relative block 11656 -- 40 blocks later. That
+			 * can only happen if the recovery actually worked at 11616 (a
+			 * false-negative response-token read -- rome dump confirmed
+			 * correct, matching data was already on the card) and then a
+			 * SECOND, genuinely-different failure happened 40 blocks on. So
+			 * not every rejection is a false alarm; some are real. This loop
+			 * handles both: verify what's on the card first (recovers the
+			 * false-alarm case for free, no write needed), and if it's a
+			 * genuine mismatch, retry the write up to 2 more times.
 			 *
-			 * (Why not just retry the send instead of verifying: the 515-byte
-			 * SPIM burst for this block has ALREADY been fully transmitted to
-			 * the card by the time a rejection is even detected -- spim_xfer
-			 * happens unconditionally, before the status-token read. Blindly
-			 * resending into an ongoing CMD25 stream is not verified safe,
-			 * since the card may treat the resend as the NEXT sequential
-			 * block rather than a retry of this one, silently shifting every
-			 * block after it by one position. Verifying what's already there
-			 * sidesteps that risk entirely -- nothing is ever resent.) */
-			uint8_t mbf = emmc_mb_fail();
+			 * The retry is safe now in a way a same-loop resend was NOT (see
+			 * the earlier, rejected approach): each attempt ENDS the current
+			 * session first, then opens a BRAND NEW CMD25 session with block
+			 * addr = failed_block explicitly. The card is told exactly which
+			 * block this is, not "whatever comes next in an ongoing stream"
+			 * -- so there's no possibility of it landing at the wrong offset
+			 * even if a retry itself also gets misjudged as a reject. */
 			uint32_t failed_block = g_upload.block_start + g_upload.blocks_written;
+			uint8_t mbf = 0;
+			bool recovered = false;
 
-			emmc_write_multi_end();
-			g_upload.multi_begun = false;
+			for (int attempt = 0; attempt < 3; attempt++) {
+				mbf = emmc_mb_fail();
+				emmc_write_multi_end();
+				g_upload.multi_begun = false;
 
-			static uint8_t s_verify_buf[512];
-			bool verified = emmc_read_block(failed_block, s_verify_buf) &&
-			                memcmp(s_verify_buf, s_block_buf, 512) == 0;
+				static uint8_t s_verify_buf[512];
+				if (emmc_read_block(failed_block, s_verify_buf) &&
+				    memcmp(s_verify_buf, s_block_buf, 512) == 0) {
+					recovered = true;
+					break;
+				}
+				if (attempt == 2) break;   /* out of retries */
 
-			if (verified) {
-				g_upload.blocks_written++;
+				uint32_t remaining_from_here =
+					g_upload.blocks_expected - g_upload.blocks_written;
+				if (!emmc_write_multi_begin(failed_block, remaining_from_here))
+					break;
+				g_upload.multi_begun = true;
+				if (emmc_write_multi_block(s_block_buf)) { recovered = true; break; }
+				/* still failing -- loop: end session, verify/retry again */
+			}
+
+			if (!recovered) {
+				/* 2=resp-reject, 3=busy-timeout, 4=unknown -- see usb.h. */
+				g_ul_fail = (mbf == 1) ? 2 : (mbf == 2) ? 3 : 4;
+				g_ul_fail_block = g_upload.blocks_written;
+				ok = false;
+				break;
+			}
+
+			/* Recovered -- either the original write was fine all along, or a
+			 * retry's write succeeded. Count it. If multi_begun is already
+			 * true, a retry-write left the session open and correctly
+			 * positioned right after this block; only reopen if verification
+			 * alone recovered it (session was ended, nothing written since). */
+			g_upload.blocks_written++;
+			if (!g_upload.multi_begun) {
 				uint32_t remaining = g_upload.blocks_expected - g_upload.blocks_written;
 				if (remaining > 0) {
 					if (!emmc_write_multi_begin(g_upload.block_start + g_upload.blocks_written,
 					                             remaining)) {
-						g_ul_fail = (mbf == 1) ? 2 : (mbf == 2) ? 3 : 4;
+						g_ul_fail = 4;
 						g_ul_fail_block = g_upload.blocks_written;
 						ok = false;
 						break;
 					}
 					g_upload.multi_begun = true;
 				}
-				continue;   /* proceed to the next block in this batch */
 			}
-
-			/* Genuine mismatch/failure. Distinct fail codes (was a single
-			 * collapsed "2=write-fail") so this says exactly which failure
-			 * mode it was instead of leaving it a guess: 2=resp-reject,
-			 * 3=busy-timeout, 4=unknown. */
-			g_ul_fail = (mbf == 1) ? 2 : (mbf == 2) ? 3 : 4;
-			g_ul_fail_block = g_upload.blocks_written;
-			ok = false;
-			break;
+			continue;   /* proceed to the next block in this batch */
 		}
 		g_upload.blocks_written++;
 	}
