@@ -40,7 +40,31 @@ the sp-1 has no hard reset so to get back:
 
 ## rome
 
-**[rome](https://github.com/jackiscool123123121/rome)** is the companion cli — flash firmware, enter the bootloader, and manage stems on the device over USB.
+**[rome](https://github.com/jackiscool123123121/rome)** is the companion cli — flash firmware, enter the bootloader, and manage stems on the device over USB. **it is required to use marisko.**
+
+install it with a one-liner:
+
+**macOS / Linux (sh):**
+```
+curl -sSL https://raw.githubusercontent.com/jackiscool123123121/rome/main/install.sh | sh
+```
+
+**Windows (PowerShell):**
+```
+irm https://raw.githubusercontent.com/jackiscool123123121/rome/main/install.ps1 | iex
+```
+
+on a fresh device you **must run `rome format` before loading any music** —
+it writes the disk header (v3) that stems get stored against:
+
+```
+rome format --yes
+```
+
+then upload songs:
+```
+rome song add "my song" drums.wav vocals.wav bass.wav other.wav
+```
 
 ## building
 
