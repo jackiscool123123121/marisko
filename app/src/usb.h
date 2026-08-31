@@ -47,6 +47,11 @@
                                         * SYSTEM_OFF + cleared RESETREAS is the
                                         * documented way to return, and this works
                                         * even if the function button is unreachable. */
+#define USB_CMD_SONG_SWAP       0x11u  /* idx_a[2 LE] + idx_b[2 LE] -> OK. Swaps
+                                        * two catalog entries in place (playback
+                                        * order = catalog order) so a host tool
+                                        * can reorder the track list without any
+                                        * audio data moving. */
 
 #define USB_STATUS_OK         0x00u
 #define USB_STATUS_ERR        0xFFu

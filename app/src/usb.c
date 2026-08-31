@@ -499,6 +499,26 @@ static void handle_song_remove(const uint8_t *payload, uint32_t plen)
 	send_ok(NULL, 0);
 }
 
+/* 0x11 SONG_SWAP: idx_a[2 LE] + idx_b[2 LE]. Playback order is catalog order
+ * (see disk.h), so reordering the track list is just swapping two 32-byte
+ * catalog entries -- no audio data moves. Rejected during an active upload
+ * (SONG_BEGIN already wrote a provisional entry at its own index; swapping
+ * around that mid-upload would leave next_free_block/blocks_written pointed
+ * at the wrong catalog slot). Same-index swap is a harmless no-op. */
+static void handle_song_swap(const uint8_t *payload, uint32_t plen)
+{
+	if (plen < 4) { send_err(); return; }
+	if (g_upload.active) { send_err(); return; }
+	uint16_t idx_a = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+	uint16_t idx_b = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
+	if (idx_a == idx_b) { send_ok(NULL, 0); return; }
+
+	disk_song_entry_t a, b;
+	if (!disk_read_song(idx_a, &a) || !disk_read_song(idx_b, &b)) { send_err(); return; }
+	if (!disk_write_song(idx_a, &b) || !disk_write_song(idx_b, &a)) { send_err(); return; }
+	send_ok(NULL, 0);
+}
+
 /* 0x08 CATALOG_READ: stream all 8 catalog blocks (4096 bytes total) */
 static void handle_catalog_read(void)
 {
@@ -535,6 +555,7 @@ static void dispatch(uint8_t cmd, const uint8_t *payload, uint32_t plen)
 	case USB_CMD_WRITE_STRESS:    handle_write_stress(payload, plen);   break;
 	case USB_CMD_AUDIO_DIAG:      handle_audio_diag();                  break;
 	case USB_CMD_POWER_OFF:       handle_power_off();                   break;
+	case USB_CMD_SONG_SWAP:       handle_song_swap(payload, plen);      break;
 	default:                      send_err();                          break;
 	}
 }

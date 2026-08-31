@@ -482,19 +482,37 @@ int main(void)
 	 * dead. The README has claimed this as a shipped feature; nothing ever
 	 * implemented it. 2 round trips at 30 ms/step (~360 ms total) -- long
 	 * enough to read as a deliberate animation, short enough not to feel like
-	 * a delay before the device is usable. Feeds the watchdog throughout. */
-	for (int step = 0; step < 12; step++) {
-		int pos = step % 6;
-		int lit = (pos <= 3) ? pos : 6 - pos;   /* 0,1,2,3,2,1 -> bounce */
-		for (int i = 0; i < NUM_PB_LEDS; i++) {
-			int dist = i - lit; if (dist < 0) dist = -dist;
-			uint16_t duty = (dist == 0) ? PWM_TOP : (dist == 1) ? PWM_TOP / 6 : 0;
-			pwm1_set_duty(i, duty);
+	 * a delay before the device is usable. Feeds the watchdog throughout.
+	 *
+	 * Skipped on an off_wake boot: the power-on hold gate above already ran a
+	 * full 3 s "device is alive" fill animation, ending with all 8 LEDs lit.
+	 * Playing this ~360 ms extra bounce on TOP of that made a power-on-from-
+	 * off take longer overall than a power-off (3.36 s vs 3.0 s) even though
+	 * the two hold-fill animations are the same 3000 ms -- the bounce was the
+	 * whole difference. A true cold boot (fresh flash, battery just
+	 * connected) has no gate before it and still gets this bounce, since
+	 * there's nothing else to signal "alive" in that case. */
+	if (!off_wake) {
+		for (int step = 0; step < 12; step++) {
+			int pos = step % 6;
+			int lit = (pos <= 3) ? pos : 6 - pos;   /* 0,1,2,3,2,1 -> bounce */
+			for (int i = 0; i < NUM_PB_LEDS; i++) {
+				int dist = i - lit; if (dist < 0) dist = -dist;
+				uint16_t duty = (dist == 0) ? PWM_TOP : (dist == 1) ? PWM_TOP / 6 : 0;
+				pwm1_set_duty(i, duty);
+			}
+			delay_ms(30);
+			feed_wdt();
 		}
-		delay_ms(30);
-		feed_wdt();
 	}
 	all_pb_off();
+	/* all_trk_off() drives the track pins via raw GPIO, but the power-on hold
+	 * gate (and, on a cold boot, nothing here at all) leaves them under PWM0's
+	 * control -- a running PWM sequence overrides a plain GPIO write on the
+	 * same pin (the same class of bug fixed earlier in the fatal handler).
+	 * Only relevant after off_wake's 8-LED fill; harmless (already zero) on a
+	 * cold boot. */
+	for (int i = 0; i < NUM_TRK_LEDS; i++) pwm0_set_duty(i, 0);
 
 	/* eMMC init. On failure: pb_led[1] blinks N times = which init step failed
 	 * (1-9). On SUCCESS nothing lights — an idle, not-playing device is dark by
