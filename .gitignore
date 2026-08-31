@@ -1,0 +1,38 @@
+# Build output
+build/
+*.hex
+*.elf
+*.o
+*.a
+
+# Keep the release binary
+!marisko.bin
+
+# Zephyr SDK
+zephyr-sdk-*/
+
+# West / nRF Connect SDK (anchored to repo root so patches/zephyr/ etc. stay tracked)
+/.west/
+/zephyr/
+/nrf/
+/bootloader/
+/modules/
+/nrfxlib/
+/tools/
+/test/
+
+# rome — companion cli, lives in its own repo: github.com/softmodded/rome
+rome/
+
+# Python
+__pycache__/
+*.pyc
+
+# Misc
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Yes - I have been AI assisted. I've been using DeepSeek hosted locally with Claude Code as a harness.  
+CLAUDE.md
