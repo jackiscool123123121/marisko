@@ -1,1 +1,1 @@
-I do not know how to build this I got ai to fix the code so it can be flashed a lot easier I will change this when I am fully done fixing I am just putting this repot so I have the fork do not flash this yet it is not finished
+I fixed the code using ai it is still not done yet I will update this with instructions when it is stable to flash
