@@ -79,7 +79,7 @@ see **[contributing.md](CONTRIBUTING.md)** for rules & guidelines.
 - **[zephyr rtos](https://www.zephyrproject.org/)** + **[nrf connect sdk](https://www.nordicsemi.com/Products/Development-software/nrf-connect-sdk)** — the foundation this firmware runs on
 - **[sp-1 developer wiki](https://github.com/timknapen/SP-1-dev)** by tim knapen — hardware documentation, pinouts, and bootloader specs
 - **[solderless](https://solderless.engineering)** — the web-based firmware and stem loader that makes all of this possible without opening the device
-
+- **[original rome](https://github.com/softmodded/marisko)** the orginal version I forked 
 ## project structure
 
 - `app/` — firmware source (`main.c` + modular `audio` / `codec` / `emmc` / `disk` / `usb` / `leds` / `saadc` / `pwm`)
