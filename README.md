@@ -2,6 +2,9 @@
 
 **custom firmware for the teenage engineering sp-1 stem player.**  
 
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/jackiscool123123121/marisko/total)
+
+
 named after the [marisko flower](https://en.wikipedia.org/wiki/Cypripedium_calceolus)  
 originally forked from [softmodded/marisko](https://github.com/softmodded/marisko)
 
