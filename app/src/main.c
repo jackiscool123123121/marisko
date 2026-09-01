@@ -550,14 +550,24 @@ int main(void)
 		 * unlike enter_system_off(), no codec_power_down()/emmc_power_down()
 		 * call belongs here. */
 		bool held_full = true;
-		for (int ms = 0; ms < 3000; ms += 20) {
+		int64_t hold_start = k_uptime_get();
+		while (1) {
 			if (NRF_P0->IN & (1u << 27)) { held_full = false; break; }  /* released early */
-			int filled = ms * (NUM_PB_LEDS + NUM_TRK_LEDS) / 3000;
+			int64_t held_ms = k_uptime_get() - hold_start;
+			if (held_ms >= 3000) break;
+			/* Paced by k_uptime_get() (RTC-backed), not delay_ms() (an
+			 * imprecise NOP busy-wait -- see util.h) -- this is what keeps
+			 * this fill's real duration matching enter_system_off()'s
+			 * identical fill, which is timed the same way. Using delay_ms()
+			 * here made the two animations drift apart because a NOP count
+			 * calibrated for 64 MHz doesn't land on the same wall-clock time
+			 * this early in boot as it does deep into runtime. */
+			int filled = (int)(held_ms * (NUM_PB_LEDS + NUM_TRK_LEDS) / 3000);
 			for (int i = 0; i < NUM_PB_LEDS; i++)
 				pwm1_set_duty(i, (i < filled) ? PWM_TOP : 0);
 			for (int i = 0; i < NUM_TRK_LEDS; i++)
 				pwm0_set_duty(i, (NUM_PB_LEDS + i < filled) ? PWM_TOP : 0);
-			delay_ms(20);
+			k_msleep(20);
 			feed_wdt();
 		}
 		if (!held_full) {
