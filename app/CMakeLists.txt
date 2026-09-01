@@ -12,4 +12,5 @@ target_sources(app PRIVATE
   src/usb.c
   src/codec.c
   src/audio.c
+  src/battery.c
 )

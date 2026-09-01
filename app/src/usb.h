@@ -52,6 +52,8 @@
                                         * order = catalog order) so a host tool
                                         * can reorder the track list without any
                                         * audio data moving. */
+#define USB_CMD_BATTERY         0x12u  /* no payload -> OK + [percent:1][charging:1][usb_present:1].
+                                        * percent is 0xFF if the ADC read failed. */
 
 #define USB_STATUS_OK         0x00u
 #define USB_STATUS_ERR        0xFFu

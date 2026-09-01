@@ -4,6 +4,7 @@
 #include "codec.h"
 #include "audio.h"
 #include "saadc.h"
+#include "battery.h"
 #include "util.h"
 
 #include <zephyr/device.h>
@@ -216,6 +217,19 @@ static void handle_audio_diag(void)
 	audio_diag_t d;
 	audio_get_diag(&d);
 	send_ok((const uint8_t *)&d, sizeof(d));
+}
+
+/* 0x12 BATTERY: no payload → [percent:1][charging:1][usb_present:1].
+ * percent is 0xFF if the ADC read failed (rather than folding that into an
+ * error response -- charging/usb_present are still valid either way). */
+static void handle_battery(void)
+{
+	uint8_t r[3];
+	int pct = battery_percent();
+	r[0] = (pct < 0) ? 0xFFu : (uint8_t)pct;
+	r[1] = battery_charging()    ? 1u : 0u;
+	r[2] = usb_power_present()   ? 1u : 0u;
+	send_ok(r, sizeof(r));
 }
 
 static void handle_codec_diag(void)
@@ -556,6 +570,7 @@ static void dispatch(uint8_t cmd, const uint8_t *payload, uint32_t plen)
 	case USB_CMD_AUDIO_DIAG:      handle_audio_diag();                  break;
 	case USB_CMD_POWER_OFF:       handle_power_off();                   break;
 	case USB_CMD_SONG_SWAP:       handle_song_swap(payload, plen);      break;
+	case USB_CMD_BATTERY:         handle_battery();                     break;
 	default:                      send_err();                          break;
 	}
 }

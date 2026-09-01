@@ -10,6 +10,7 @@
 #include "codec.h"
 #include "audio.h"
 #include "disk.h"
+#include "battery.h"
 
 struct btn_db { bool raw_prev, stable; uint8_t cnt; };
 
@@ -537,6 +538,9 @@ int main(void)
 	saadc_init();
 	pwm0_init();
 	pwm1_init();   /* pb_leds via PWM1 (dimmable) — before any set_pb_on() */
+	charger_init(); /* make sure the battery actually charges; also arms
+	                  * usb_power_present()/battery_charging() for the
+	                  * off_wake gate below. */
 
 	if (off_wake) {
 		/* Power-ON gate, symmetric with the power-OFF hold: require the
@@ -551,9 +555,10 @@ int main(void)
 		 * call belongs here. */
 		bool held_full = true;
 		int64_t hold_start = k_uptime_get();
+		int64_t held_ms = 0;
 		while (1) {
 			if (NRF_P0->IN & (1u << 27)) { held_full = false; break; }  /* released early */
-			int64_t held_ms = k_uptime_get() - hold_start;
+			held_ms = k_uptime_get() - hold_start;
 			if (held_ms >= 3000) break;
 			/* Paced by k_uptime_get() (RTC-backed), not delay_ms() (an
 			 * imprecise NOP busy-wait -- see util.h) -- this is what keeps
@@ -576,6 +581,36 @@ int main(void)
 			 * SYSTEM_OFF with SENSE re-armed. No boot happened. */
 			for (int i = 0; i < NUM_PB_LEDS; i++)  pwm1_set_duty(i, 0);
 			for (int i = 0; i < NUM_TRK_LEDS; i++) pwm0_set_duty(i, 0);
+
+			/* A brief tap (< 600 ms) while plugged into power reads as
+			 * "show me the battery", not a failed boot attempt: show the
+			 * charge level on the track LEDs (best guess at "right hand
+			 * side" -- trivial one-line swap to pb_leds/pwm1 if that's
+			 * actually the left side on the real unit) for ~3 s, then fall
+			 * through to the same re-arm-and-sleep below. A longer partial
+			 * hold (600 ms-3 s) stays a plain aborted boot with no gauge,
+			 * so a half-hearted boot attempt isn't misread as a battery
+			 * check. */
+			if (held_ms < 600 && usb_power_present()) {
+				int64_t peek_start = k_uptime_get();
+				while (k_uptime_get() - peek_start < 3000) {
+					int q = battery_quarters();
+					bool chg = battery_charging();
+					bool blink = ((k_uptime_get() / 250) & 1) == 0;
+					for (int i = 0; i < NUM_TRK_LEDS; i++) {
+						bool on;
+						if (q <= 0)           on = false;
+						else if (i < q - 1)   on = true;
+						else if (i == q - 1)  on = chg ? blink : true;
+						else                  on = false;
+						pwm0_set_duty(i, on ? PWM_TOP : 0);
+					}
+					k_msleep(40);
+					feed_wdt();
+				}
+				for (int i = 0; i < NUM_TRK_LEDS; i++) pwm0_set_duty(i, 0);
+			}
+
 			for (int i = 0; i < 150 && !(NRF_P0->IN & (1u << 27)); i++) {
 				k_msleep(20);
 				feed_wdt();
