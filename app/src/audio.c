@@ -90,6 +90,39 @@ static uint32_t s_loop_start, s_loop_end;
 static int16_t s_loop_pred[8];
 static int8_t s_loop_sidx[8];
 
+/* In-RAM loop cache.  Looping by re-reading the loop region off eMMC on every
+ * pass would stall the feed thread at the seam (a blocking CMD18 refill the
+ * moment the wrap needs a block no longer in the 64-block prefetch window),
+ * which is audible as a ~0.5 s gap.  Instead, load the whole loop region into
+ * RAM once at loop start and serve every wrap from it: the seam becomes a pure
+ * pointer reset, so it is seamless.  Loops larger than the cache fall back to
+ * the prefetch path (still works, just seeks at the seam).
+ *
+ * Prefetch, the baked level array and the loop cache share one RAM pool.
+ * Prefetch + levels are never both live while looping (the track LEDs show the
+ * loop divider instead of stem levels), so the loop cache reuses those bytes —
+ * net-zero RAM (pf 32 KB + lvl 24 KB = 56 KB) yet covers the default ~93-block
+ * loop entirely in RAM. */
+#define PREFETCH_BLOCKS 64u        /* see prefetch comment below */
+#define LOOP_CAP_BLOCKS 96u        /* ≤ (PREFETCH_BLOCKS*512 + LVL_MAX_BYTES)/512 */
+#define LVL_MAX_BYTES   24576u     /* baked-level RAM cap (see levels comment) */
+union audio_buf {
+	struct {
+		uint8_t pf[PREFETCH_BLOCKS * 512u];
+		uint8_t lvl[LVL_MAX_BYTES];
+	} normal;
+	uint8_t loop[LOOP_CAP_BLOCKS * 512u];
+};
+static union audio_buf s_audio_buf;
+#define s_pf_buf  s_audio_buf.normal.pf
+#define s_lvl_ram s_audio_buf.normal.lvl
+/* Loop cache view is s_audio_buf.loop (loop_preload / fill_block). */
+
+static bool     s_loop_cache_ok;  /* loop_len fits in cache and it is loaded */
+static uint32_t s_loop_len;       /* blocks in the loop */
+static uint32_t s_loop_pos;       /* next cache index to serve (0..loop_len-1) */
+static volatile bool s_loop_pf_dirty;  /* loop stopped: reset prefetch on feed */
+
 static void loop_set_end(void)
 {
 	uint32_t len = LOOP_BASE_BLOCKS / s_loop_divisors[s_loop_div_idx];
@@ -97,6 +130,19 @@ static void loop_set_end(void)
 	if (len > s_song_block_count) len = s_song_block_count;
 	s_loop_end = s_loop_start + len;
 	if (s_loop_end > s_song_block_count) s_loop_end = s_song_block_count;
+}
+
+/* Load the whole loop region into s_audio_buf.loop so every wrap can be served
+ * from RAM with no eMMC access.  Runs on the feed thread once, at loop start. */
+static void loop_preload(void)
+{
+	s_loop_len = s_loop_end - s_loop_start;
+	s_loop_cache_ok = false;
+	if (s_loop_len == 0 || s_loop_len > LOOP_CAP_BLOCKS) return;
+	if (emmc_read_blocks(s_song_block_start + s_loop_start, s_audio_buf.loop, s_loop_len)) {
+		s_loop_cache_ok = true;
+		s_loop_pos = 0;
+	}
 }
 
 /* Playlist: feed thread advances to the next catalog song at end-of-song,
@@ -136,14 +182,7 @@ static void change_song(int dir)
 /* Prefetch: one slow bit-bang CMD17 per 128-frame buffer (~2-3 ms) can't keep
  * up with the 2.67 ms playback budget → underrun buzz. Read PREFETCH_BLOCKS at
  * once via CMD18 streaming (amortizes command overhead) and decode from RAM. */
-#define PREFETCH_BLOCKS 64u  /* amortizes the ~7 ms fixed per-read CMD overhead. The
-                              * cost is data(~1.01 ms/blk) + 7 ms/N: N=16→1.45, N=32→
-                              * 1.23 ms/blk. The decode+write of a 4-stem block eats the
-                              * rest of the 2.67 ms budget, so cutting read/blk is the
-                              * only steady-state margin left. Bigger N is monotonically
-                              * better (N=4→2.8 ms blew the budget); deep TX queue absorbs
-                              * the longer ~40 ms burst read. */
-static uint8_t  s_pf_buf[PREFETCH_BLOCKS * 512u];
+/* (PREFETCH_BLOCKS is defined above with the loop cache; it shares s_pf_buf.) */
 static uint32_t s_pf_pos;    /* next block index within s_pf_buf to decode */
 static uint32_t s_pf_count;  /* valid blocks currently in s_pf_buf */
 static volatile uint32_t s_last_read_us;  /* diag: µs per block of last refill */
@@ -172,7 +211,7 @@ void audio_set_stem_gains(const uint16_t g[4])
  * on a feed stall cur_block freezes so the meter holds rather than dropping. */
 #define LVL_DECIM     16u       /* audio blocks per baked level sample — must match rome */
 #define LVL_STEMS     4u        /* bytes per sample (one peak per stem) */
-#define LVL_MAX_BYTES 24576u    /* RAM cap: ~4.4 min @ DECIM=16, 4 stems; longer truncates */
+/* (LVL_MAX_BYTES is defined above with the loop cache; s_lvl_ram shares it.) */
 
 static bool              s_lvl_enabled;   /* disk reports v2 → levels present */
 static bool              s_lvl_present;   /* current song has a level region */
@@ -180,7 +219,6 @@ static bool              s_lvl_loaded;    /* level array read into RAM for this 
 static uint32_t          s_lvl_start;     /* first level block of current song */
 static uint32_t          s_lvl_blocks;    /* level blocks to read (capped) */
 static uint32_t          s_lvl_count;     /* valid level bytes in s_lvl_ram */
-static uint8_t           s_lvl_ram[LVL_MAX_BYTES];
 
 /* Recompute the level region for a song from its (audio) block_start/count. */
 static void lvl_setup(uint32_t block_start, uint32_t block_count)
@@ -215,6 +253,53 @@ static int16_t adpcm_step(uint8_t nibble, int ch)
 
 /* ── Buffer fill ────────────────────────────────────────────────────────────── */
 
+/* Mix + ADPCM-decode one 512-byte block (4 stereo stems) into 128 stereo frames.
+ * Shared by the prefetch path and the in-RAM loop cache so both stay identical. */
+static void decode_block(const uint8_t *blk, int32_t *buf)
+{
+	int32_t bufpeak = 0;
+	for (uint32_t i = 0; i < FRAMES_PER_BLOCK; i++) {
+		int32_t l = 0, r = 0;
+		/* Mix all 4 stems: each stem = 128 bytes (64 L + 64 R) */
+		for (int stem = 0; stem < 4; stem++) {
+			uint32_t ol = (uint32_t)stem * 128u + i / 2u;
+			uint32_t or_ = (uint32_t)stem * 128u + 64u + i / 2u;
+			uint8_t bl  = blk[ol];
+			uint8_t br  = blk[or_];
+			uint8_t nl  = (i & 1u) ? (bl >> 4) : (bl & 0xFu);
+			uint8_t nr  = (i & 1u) ? (br >> 4) : (br & 0xFu);
+			/* Decode every stem (advances its ADPCM predictor even when
+			 * silenced, so a muted fader never desyncs the decoder), then
+			 * scale by the live fader gain (0..256, 256 = unity). */
+			int32_t g = s_stem_gain[stem];
+			l += (adpcm_step(nl, stem * 2)     * g) >> 8;
+			r += (adpcm_step(nr, stem * 2 + 1) * g) >> 8;
+		}
+		/* Average 4 stems (>>2): sum of four ±32767 values is ±131068,
+		 * so >>2 → ±32767 max and NEVER clips. The old >>1 clipped hard
+		 * whenever 2+ stems were loud → constant crunch/clicks. Make up
+		 * the 6 dB with the speaker volume. Clamp kept as a safety net. */
+		l >>= 2;
+		r >>= 2;
+		if (l >  32767) l =  32767;
+		if (l < -32768) l = -32768;
+		if (r >  32767) r =  32767;
+		if (r < -32768) r = -32768;
+		/* Track buffer peak for the LED visualizer. */
+		int32_t al = l < 0 ? -l : l;
+		int32_t ar = r < 0 ? -r : r;
+		if (al > bufpeak) bufpeak = al;
+		if (ar > bufpeak) bufpeak = ar;
+		/* 16-bit sample → 24-bit right-aligned (bits[23:8]) */
+		buf[2 * i]     = (int32_t)(l << 8);
+		buf[2 * i + 1] = (int32_t)(r << 8);
+	}
+	/* Peak-hold for the LED VU. Main reads + resets this every loop and
+	 * applies its own time-based decay — so the meter stays smooth even
+	 * while the feed thread is busy in a multi-block eMMC read. */
+	if (bufpeak > s_peak) s_peak = bufpeak;
+}
+
 static void fill_block(int32_t *buf)
 {
 	if (s_source == AUDIO_SRC_TONE) {
@@ -242,7 +327,36 @@ static void fill_block(int32_t *buf)
 			}
 			loop_set_end();
 			s_loop_active = s_loop_end > s_loop_start;
+			loop_preload();
+			s_loop_pf_dirty = false;
 		}
+
+		/* Loop stopped (Play released / song changed): drop any stale prefetch
+		 * so the normal path re-reads from the current position, and drop the
+		 * cache we no longer need. */
+		if (s_loop_pf_dirty) {
+			s_loop_pf_dirty = false;
+			s_loop_cache_ok = false;
+			s_pf_pos = s_pf_count = 0;
+		}
+
+		/* Seamless in-RAM loop: every pass is served from s_loop_buf, never
+		 * touching eMMC, so the wrap is an instant pointer reset (no stall). */
+		if (s_loop_active && s_loop_cache_ok) {
+			decode_block(s_audio_buf.loop + s_loop_pos * 512u, buf);
+			if (++s_loop_pos >= s_loop_len) {
+				s_loop_pos = 0;
+				s_cur_block = s_loop_start;
+				for (int i = 0; i < 8; i++) {
+					s_pred[i] = s_loop_pred[i];
+					s_sidx[i] = s_loop_sidx[i];
+				}
+			} else {
+				s_cur_block++;
+			}
+			return;
+		}
+
 		if (s_loop_active && s_cur_block >= s_loop_end) {
 			s_cur_block = s_loop_start;
 			s_pf_pos = s_pf_count = 0;
@@ -256,6 +370,8 @@ static void fill_block(int32_t *buf)
 			s_cur_block = 0;
 			s_pf_pos = s_pf_count = 0;   /* force refill from block 0 */
 			for (int i = 0; i < 8; i++) { s_pred[i] = 0; s_sidx[i] = 0; }
+			s_loop_active = false;
+			s_loop_cache_ok = false;
 		}
 
 		/* Refill prefetch buffer when exhausted (batched CMD18 streaming read). */
@@ -286,49 +402,9 @@ static void fill_block(int32_t *buf)
 
 		{
 			const uint8_t *blk = s_pf_buf + s_pf_pos * 512u;
-			int32_t bufpeak = 0;
 			s_pf_pos++;
 			s_cur_block++;
-			for (uint32_t i = 0; i < FRAMES_PER_BLOCK; i++) {
-				int32_t l = 0, r = 0;
-				/* Mix all 4 stems: each stem = 128 bytes (64 L + 64 R) */
-				for (int stem = 0; stem < 4; stem++) {
-					uint32_t ol = (uint32_t)stem * 128u + i / 2u;
-					uint32_t or_ = (uint32_t)stem * 128u + 64u + i / 2u;
-					uint8_t bl = blk[ol];
-					uint8_t br = blk[or_];
-					uint8_t nl = (i & 1u) ? (bl >> 4) : (bl & 0xFu);
-					uint8_t nr = (i & 1u) ? (br >> 4) : (br & 0xFu);
-					/* Decode every stem (advances its ADPCM predictor even when
-					 * silenced, so a muted fader never desyncs the decoder), then
-					 * scale by the live fader gain (0..256, 256 = unity). */
-					int32_t g = s_stem_gain[stem];
-					l += (adpcm_step(nl, stem * 2)     * g) >> 8;
-					r += (adpcm_step(nr, stem * 2 + 1) * g) >> 8;
-				}
-				/* Average 4 stems (>>2): sum of four ±32767 values is ±131068,
-				 * so >>2 → ±32767 max and NEVER clips. The old >>1 clipped hard
-				 * whenever 2+ stems were loud → constant crunch/clicks. Make up
-				 * the 6 dB with the speaker volume. Clamp kept as a safety net. */
-				l >>= 2;
-				r >>= 2;
-				if (l >  32767) l =  32767;
-				if (l < -32768) l = -32768;
-				if (r >  32767) r =  32767;
-				if (r < -32768) r = -32768;
-				/* Track buffer peak for the LED visualizer. */
-				int32_t al = l < 0 ? -l : l;
-				int32_t ar = r < 0 ? -r : r;
-				if (al > bufpeak) bufpeak = al;
-				if (ar > bufpeak) bufpeak = ar;
-				/* 16-bit sample → 24-bit right-aligned (bits[23:8]) */
-				buf[2 * i]     = (int32_t)(l << 8);
-				buf[2 * i + 1] = (int32_t)(r << 8);
-			}
-			/* Peak-hold for the LED VU. Main reads + resets this every loop and
-			 * applies its own time-based decay — so the meter stays smooth even
-			 * while the feed thread is busy in a multi-block eMMC read. */
-			if (bufpeak > s_peak) s_peak = bufpeak;
+			decode_block(blk, buf);
 			return;
 		}
 tone_fallback:
@@ -489,6 +565,8 @@ void audio_load_song(uint32_t block_start, uint32_t block_count)
 	s_playing          = false;
 	s_loop_active      = false;
 	s_loop_start_req   = false;
+	s_loop_cache_ok    = false;
+	s_loop_pf_dirty    = false;
 	s_song_block_start = block_start;
 	s_song_block_count = block_count;
 	s_cur_block        = 0;
@@ -509,7 +587,12 @@ void audio_loop_start(void)
 	s_loop_start_req = true;
 }
 
-void audio_loop_stop(void) { s_loop_start_req = false; s_loop_active = false; }
+void audio_loop_stop(void)
+{
+	s_loop_start_req = false;
+	s_loop_active    = false;
+	s_loop_pf_dirty  = true;
+}
 
 void audio_loop_change_divider(int direction)
 {
@@ -517,7 +600,9 @@ void audio_loop_change_divider(int direction)
 	if (next < 0) next = 0;
 	if (next >= (int)LOOP_DIV_COUNT) next = (int)LOOP_DIV_COUNT - 1;
 	s_loop_div_idx = (uint8_t)next;
-	if (s_loop_active) loop_set_end();
+	/* Re-anchor and reload the cache at the new length so the wrap stays
+	 * in-RAM and seamless; resolves like the rocker on the feed thread. */
+	if (s_loop_active) s_loop_start_req = true;
 }
 
 void audio_loop_move(int direction)
