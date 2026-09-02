@@ -75,6 +75,30 @@ static uint32_t s_song_block_count;
 static uint32_t s_cur_block;
 static volatile bool s_playing;
 
+/* Basic-mode loop state.  Looping is momentary: the UI owns the hold gesture
+ * and clears this flag when Play is released. */
+#define LOOP_DIV_COUNT 5u
+static const uint8_t s_loop_divisors[LOOP_DIV_COUNT] = { 1u, 2u, 4u, 8u, 16u };
+/* 128 frames/block at 48 kHz = 375 blocks/second.  A loop must be short
+ * enough to repeat while Play is being held; deriving its length from the
+ * entire song made a 1/4 setting take tens of seconds on a long stem. */
+#define LOOP_BASE_BLOCKS 375u
+static volatile bool s_loop_active;
+static volatile bool s_loop_start_req;
+static volatile uint8_t s_loop_div_idx = 2u;
+static uint32_t s_loop_start, s_loop_end;
+static int16_t s_loop_pred[8];
+static int8_t s_loop_sidx[8];
+
+static void loop_set_end(void)
+{
+	uint32_t len = LOOP_BASE_BLOCKS / s_loop_divisors[s_loop_div_idx];
+	if (len == 0) len = 1;
+	if (len > s_song_block_count) len = s_song_block_count;
+	s_loop_end = s_loop_start + len;
+	if (s_loop_end > s_song_block_count) s_loop_end = s_song_block_count;
+}
+
 /* Playlist: feed thread advances to the next catalog song at end-of-song,
  * wrapping after the last. disk_read_song runs in the feed thread (same thread
  * that owns the eMMC during playback) — no cross-thread bus race. */
@@ -207,7 +231,26 @@ static void fill_block(int32_t *buf)
 
 	if (s_source == AUDIO_SRC_ADPCM && s_playing && s_song_block_count > 0
 	    && !emmc_write_multi_active()) {
-		if (s_skip_req != 0 || s_cur_block >= s_song_block_count) {
+		/* Consume loop start on the feed thread so the saved ADPCM state and
+		 * block position are an atomic, decoder-owned boundary. */
+		if (s_loop_start_req) {
+			s_loop_start_req = false;
+			s_loop_start = s_cur_block < s_song_block_count ? s_cur_block : 0;
+			for (int i = 0; i < 8; i++) {
+				s_loop_pred[i] = s_pred[i];
+				s_loop_sidx[i] = s_sidx[i];
+			}
+			loop_set_end();
+			s_loop_active = s_loop_end > s_loop_start;
+		}
+		if (s_loop_active && s_cur_block >= s_loop_end) {
+			s_cur_block = s_loop_start;
+			s_pf_pos = s_pf_count = 0;
+			for (int i = 0; i < 8; i++) {
+				s_pred[i] = s_loop_pred[i];
+				s_sidx[i] = s_loop_sidx[i];
+			}
+		} else if (s_skip_req != 0 || s_cur_block >= s_song_block_count) {
 			change_song(s_skip_req < 0 ? -1 : 1);  /* rocker skip, or natural end */
 			s_skip_req  = 0;
 			s_cur_block = 0;
@@ -444,6 +487,8 @@ void audio_set_playlist(uint16_t song_count, uint16_t current_idx)
 void audio_load_song(uint32_t block_start, uint32_t block_count)
 {
 	s_playing          = false;
+	s_loop_active      = false;
+	s_loop_start_req   = false;
 	s_song_block_start = block_start;
 	s_song_block_count = block_count;
 	s_cur_block        = 0;
@@ -457,6 +502,35 @@ void audio_set_levels_enabled(bool enabled) { s_lvl_enabled = enabled; }
 void audio_play(void)  { s_playing = true; }
 void audio_pause(void) { s_playing = false; }
 void audio_skip(int dir) { s_skip_req = (dir < 0) ? -1 : 1; }
+
+void audio_loop_start(void)
+{
+	if (s_song_block_count == 0) return;
+	s_loop_start_req = true;
+}
+
+void audio_loop_stop(void) { s_loop_start_req = false; s_loop_active = false; }
+
+void audio_loop_change_divider(int direction)
+{
+	int next = (int)s_loop_div_idx + (direction < 0 ? -1 : 1);
+	if (next < 0) next = 0;
+	if (next >= (int)LOOP_DIV_COUNT) next = (int)LOOP_DIV_COUNT - 1;
+	s_loop_div_idx = (uint8_t)next;
+	if (s_loop_active) loop_set_end();
+}
+
+void audio_loop_move(int direction)
+{
+	(void)direction;
+	/* Re-anchor at a decoded block boundary; this is safe for the ADPCM state
+	 * and gives the rocker a responsive momentary loop gesture. */
+	if (s_loop_active) audio_loop_start();
+}
+
+bool audio_loop_active(void) { return s_loop_active; }
+uint8_t audio_loop_div_idx(void) { return s_loop_div_idx; }
+uint8_t audio_loop_div_count(void) { return LOOP_DIV_COUNT; }
 
 /* Index of stem `stem` in the baked level array at block `blk`, or UINT32_MAX
  * if there is no valid baked level. The caller passes a smooth real-time block

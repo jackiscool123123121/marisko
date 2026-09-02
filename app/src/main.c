@@ -224,6 +224,7 @@ static uint8_t track_mask(int al)
 #define FADER_MIN 120   /* raw ADC at bottom of travel → gain 0 */
 #define FADER_MAX 3100  /* raw ADC at top of travel    → gain 256 (unity) */
 #define VU_REF    171   /* baked level 0..255 that fills the 4-bar pb meter */
+#define LOOP_HOLD_MS 300
 
 /* Shared UI state: the buttons (main thread) write these, the UI thread reads
  * them to render the pb-LED meter. */
@@ -283,6 +284,9 @@ static void ui_main(void *a, void *b, void *c)
 	int64_t volup_press_ms = 0, voldn_press_ms = 0;
 	int64_t volup_repeat_ms = 0, voldn_repeat_ms = 0;
 	struct btn_db db_play = {0}, db_volup = {0}, db_voldn = {0}, db_next = {0}, db_prev = {0};
+	int64_t play_press_ms = 0;
+	bool loop_hold_fired = false;
+	bool play_was_playing = false;
 	int vu_disp = 0;
 	int trk_disp[4] = {0, 0, 0, 0};
 	/* Smooth real-time playback position for the meters. The feed thread's
@@ -366,9 +370,28 @@ static void ui_main(void *a, void *b, void *c)
 		 * -- reuse that read rather than sampling AIN0 twice. Window per the
 		 * original main()-loop code: idle≈0, play≈1808, track1≈210. */
 		bool play_now = debounce(ain0 >= 1650 && ain0 <= 1980, &db_play);
-		if (play_now && !play_prev)
-			audio_toggle();
+		if (play_now && !play_prev) {
+			play_press_ms = k_uptime_get();
+			play_was_playing = audio_is_playing();
+			/* Arm the momentary loop at the press boundary. This avoids losing a
+			 * hold while the audio feed is busy; a short press is resolved as the
+			 * ordinary play/pause action when it is released below. */
+			audio_play();
+			audio_loop_start();
+			loop_hold_fired = true;
+		}
+		if (!play_now && play_prev) {
+			audio_loop_stop();
+			if (k_uptime_get() - play_press_ms < LOOP_HOLD_MS) {
+				/* The press temporarily starts playback so a hold can loop. For
+				 * a short tap, resolve exactly one normal toggle from the state
+				 * before the press—never play-then-toggle. */
+				if (play_was_playing) audio_pause();
+				else                 audio_play();
+			}
+		}
 		play_prev = play_now;
+		bool looping_now = play_now && loop_hold_fired;
 
 		/* Ladder 2 (AIN1): prev≈399, vol-≈729, next≈1207, vol+≈1806. */
 		int ain1 = saadc_read(2u);
@@ -403,10 +426,12 @@ static void ui_main(void *a, void *b, void *c)
 				vol_step = -1;
 			}
 		}
-		if (vol_step > 0 && s_vol_level < 7) s_vol_level++;
+		if (looping_now) {
+			if (vol_step != 0) audio_loop_change_divider(vol_step);
+		} else if (vol_step > 0 && s_vol_level < 7) s_vol_level++;
 		else if (vol_step < 0 && s_vol_level > 0) s_vol_level--;
 		else vol_step = 0;
-		if (vol_step != 0) {
+		if (vol_step != 0 && !looping_now) {
 			if (s_hp_out) hp_apply_level(s_vol_level);
 			else          codec_speaker_volume(vol_r46[s_vol_level]);
 			s_meter_ticks = 120;   /* ~1 s of volume bar at this thread's 8 ms tick */
@@ -422,8 +447,13 @@ static void ui_main(void *a, void *b, void *c)
 		/* Prev/next rocker: skip song + ensure playing. Wraparound to/from the
 		 * ends is handled inside audio_skip -> change_song (modulo arithmetic in
 		 * audio.c), not here. */
-		if (next_now && !next_prev) { audio_skip(1);  audio_play(); }
-		if (prev_now && !prev_prev) { audio_skip(-1); audio_play(); }
+		if (looping_now) {
+			if (next_now && !next_prev) audio_loop_move(1);
+			if (prev_now && !prev_prev) audio_loop_move(-1);
+		} else {
+			if (next_now && !next_prev) { audio_skip(1);  audio_play(); }
+			if (prev_now && !prev_prev) { audio_skip(-1); audio_play(); }
+		}
 		volup_prev = volup_now;
 		voldn_prev = voldn_now;
 		next_prev  = next_now;
@@ -488,11 +518,19 @@ static void ui_main(void *a, void *b, void *c)
 				pwm1_set_duty(NUM_PB_LEDS - 1 - s, (uint16_t)b);
 			}
 
-			/* Track LEDs: per-stem baked level (× fader gain), one-pole smoothed. */
-			for (int s = 0; s < 4; s++) {
-				int target = playing ? (int)audio_stem_level_at(blk, s) * PWM_TOP / 255 : 0;
-				trk_disp[s] += (target - trk_disp[s]) / 2;
-				pwm0_set_duty(s, (uint16_t)trk_disp[s]);
+			if (audio_loop_active()) {
+				/* While Play is held, the track row shows the selected divider. */
+				int lit = 1 + (audio_loop_div_idx() * (NUM_TRK_LEDS - 1)) /
+				              (audio_loop_div_count() - 1);
+				for (int s = 0; s < NUM_TRK_LEDS; s++)
+					pwm0_set_duty(s, s < lit ? PWM_TOP : 0);
+			} else {
+				/* Track LEDs: per-stem baked level (× fader gain), one-pole smoothed. */
+				for (int s = 0; s < 4; s++) {
+					int target = playing ? (int)audio_stem_level_at(blk, s) * PWM_TOP / 255 : 0;
+					trk_disp[s] += (target - trk_disp[s]) / 2;
+					pwm0_set_duty(s, (uint16_t)trk_disp[s]);
+				}
 			}
 		}
 

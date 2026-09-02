@@ -64,6 +64,16 @@ bool audio_is_playing(void);
  * the song change reads the catalog (eMMC) there to avoid a bus race. */
 void audio_skip(int dir);
 
+/* Momentary Basic-mode loop controls: the UI starts/stops these around a
+ * held Play gesture; volume changes the divider and the rocker re-anchors it. */
+void audio_loop_start(void);
+void audio_loop_stop(void);
+void audio_loop_change_divider(int direction);
+void audio_loop_move(int direction);
+bool audio_loop_active(void);
+uint8_t audio_loop_div_idx(void);
+uint8_t audio_loop_div_count(void);
+
 /* Overall VU level (0..255) for the pb-LED meter at block `blk` — the four
  * baked stem levels summed and scaled by the live fader gains (disk v3). Falls
  * back to on-device peak-hold on discs without baked levels. The caller passes
