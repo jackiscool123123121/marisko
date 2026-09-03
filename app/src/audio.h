@@ -54,6 +54,12 @@ void audio_load_song(uint32_t block_start, uint32_t block_count);
  * still advance their ADPCM decoder so they never desync. Safe from main. */
 void audio_set_stem_gains(const uint16_t g[4]);
 
+/* Basic mode's only effect: gate (rhythmic on/off chop) one stem's output.
+ * stem 0..3 gates that stem; -1 (or any other value) clears the gate. Meant
+ * to be driven live from a held button -- call again each tick while held,
+ * and with -1 the instant it's released. */
+void audio_set_gate_stem(int stem);
+
 /* Play / pause / toggle. Safe to call from the main thread at any time. */
 void audio_play(void);
 void audio_pause(void);

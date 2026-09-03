@@ -351,19 +351,32 @@ static void ui_main(void *a, void *b, void *c)
 		}
 		if (trk_pend_cnt >= 3) trk_stable = trk_pending;
 		uint8_t cur = trk_stable;
-		if (cur) {
-			if (!trk_held) { trk_press_ms = k_uptime_get(); trk_soloed = false; trk_held = true; }
-			trk_last = cur;
-			if (!trk_soloed && k_uptime_get() - trk_press_ms > 250) trk_soloed = true;
-			if (trk_soloed) s_solo_mask = cur;          /* live solo of the held set */
-		} else if (trk_held) {                              /* all released */
-			if (trk_soloed) {
-				s_solo_mask = 0;
-			} else {
-				for (int s = 0; s < 4; s++)
-					if (trk_last & (1u << s)) s_stem_muted[s] ^= 1u;
+		/* Basic mode's only effect: hold function + hold a track button to
+		 * gate that stem (see the TE guide's basic-mode page). Function-held
+		 * takes over the track button entirely -- no solo/mute toggle for
+		 * this gesture -- and the gate stops the instant either is released. */
+		bool fn_held_now = !(NRF_P0->IN & (1u << 27));   /* active-low */
+		if (fn_held_now && cur) {
+			int stem = -1;
+			for (int s = 0; s < 4; s++) if (cur & (1u << s)) { stem = s; break; }
+			audio_set_gate_stem(stem);
+			trk_held = false;   /* don't let this also register as a solo/mute hold */
+		} else {
+			audio_set_gate_stem(-1);
+			if (cur) {
+				if (!trk_held) { trk_press_ms = k_uptime_get(); trk_soloed = false; trk_held = true; }
+				trk_last = cur;
+				if (!trk_soloed && k_uptime_get() - trk_press_ms > 250) trk_soloed = true;
+				if (trk_soloed) s_solo_mask = cur;          /* live solo of the held set */
+			} else if (trk_held) {                              /* all released */
+				if (trk_soloed) {
+					s_solo_mask = 0;
+				} else {
+					for (int s = 0; s < 4; s++)
+						if (trk_last & (1u << s)) s_stem_muted[s] ^= 1u;
+				}
+				trk_held = false;
 			}
-			trk_held = false;
 		}
 
 		/* Play/pause button on the SAME AIN0 ladder as the track buttons above

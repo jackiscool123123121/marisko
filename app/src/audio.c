@@ -251,6 +251,14 @@ static int16_t adpcm_step(uint8_t nibble, int ch)
 	return s_pred[ch];
 }
 
+/* Basic mode's only effect: gate one stem while a track button is held with
+ * function down (see audio.h). -1 = no stem gated. Fixed-rate chop (no
+ * tempo sync available -- same constraint as looping) rather than a musical
+ * subdivision: half the cycle on, half off. */
+static volatile int s_gate_stem = -1;
+#define GATE_CYCLE_BLOCKS 47u   /* ~125 ms full cycle -- a typical gate/stutter rate */
+void audio_set_gate_stem(int stem) { s_gate_stem = (stem >= 0 && stem < 4) ? stem : -1; }
+
 /* ── Buffer fill ────────────────────────────────────────────────────────────── */
 
 /* Mix + ADPCM-decode one 512-byte block (4 stereo stems) into 128 stereo frames.
@@ -258,6 +266,10 @@ static int16_t adpcm_step(uint8_t nibble, int ch)
 static void decode_block(const uint8_t *blk, int32_t *buf)
 {
 	int32_t bufpeak = 0;
+	/* Snapshot once per block (not per sample): which stem, if any, is gated,
+	 * and whether this block falls in the "on" or "off" half of the cycle. */
+	int  gate_stem = s_gate_stem;
+	bool gate_on = (s_cur_block % GATE_CYCLE_BLOCKS) < (GATE_CYCLE_BLOCKS / 2u);
 	for (uint32_t i = 0; i < FRAMES_PER_BLOCK; i++) {
 		int32_t l = 0, r = 0;
 		/* Mix all 4 stems: each stem = 128 bytes (64 L + 64 R) */
@@ -272,6 +284,7 @@ static void decode_block(const uint8_t *blk, int32_t *buf)
 			 * silenced, so a muted fader never desyncs the decoder), then
 			 * scale by the live fader gain (0..256, 256 = unity). */
 			int32_t g = s_stem_gain[stem];
+			if (stem == gate_stem && !gate_on) g = 0;
 			l += (adpcm_step(nl, stem * 2)     * g) >> 8;
 			r += (adpcm_step(nr, stem * 2 + 1) * g) >> 8;
 		}
