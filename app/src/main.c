@@ -243,6 +243,14 @@ static volatile uint8_t s_solo_mask = 0;
  * and LED-fill animation underneath the gate gesture. */
 static volatile bool s_gate_gesture;
 
+/* Once a function hold has been used for a gate gesture, that whole
+ * continuous hold is disqualified from also becoming a power-off hold --
+ * even after the track button releases and function is still down. Only
+ * clears on a full physical release of function (in main(), below), so
+ * letting go of just the track button never suddenly starts the shutdown
+ * countdown/animation mid-hold. */
+static volatile bool s_fn_hold_tainted;
+
 /* Set by main() while it owns both LED rows for a gesture animation (the
  * power-off hold countdown, currently) so the UI thread's own ~125 Hz VU/meter
  * rendering doesn't fight it for the same PWM channels every 8 ms tick. */
@@ -367,6 +375,7 @@ static void ui_main(void *a, void *b, void *c)
 			for (int s = 0; s < 4; s++) if (cur & (1u << s)) { stem = s; break; }
 			audio_set_gate_stem(stem);
 			s_gate_gesture = true;   /* tell main()'s power-off hold to sit this one out */
+			s_fn_hold_tainted = true;   /* ...and keep sitting out until fn fully releases */
 			trk_held = false;   /* don't let this also register as a solo/mute hold */
 		} else {
 			audio_set_gate_stem(-1);
@@ -825,9 +834,17 @@ int main(void)
 	k_thread_name_set(&s_ui_thread, "ui");
 
 	int64_t off_hold_start = 0;   /* 0 = not currently holding function */
+	bool    fn_raw_prev = false;  /* physical P0.27 state, for detecting a full release */
 
 	while (1) {
 		bool uploading = usb_upload_active();
+
+		/* Clear the gate-hold taint only on a genuine full release of the
+		 * function button -- letting go of just the track button (still
+		 * holding function) must NOT re-arm the power-off hold mid-gesture. */
+		bool fn_raw_now = !(NRF_P0->IN & (1u << 27));
+		if (!fn_raw_now && fn_raw_prev) s_fn_hold_tainted = false;
+		fn_raw_prev = fn_raw_now;
 
 		/* Power off: a host command (rome bootloader's POWER_OFF) fires
 		 * immediately -- it isn't a physical hold, there's nothing to debounce.
@@ -842,7 +859,7 @@ int main(void)
 		if (!uploading && usb_power_off_requested())
 			enter_system_off();
 
-		bool fn_down = !(NRF_P0->IN & (1u << 27)) && !s_gate_gesture;
+		bool fn_down = fn_raw_now && !s_gate_gesture && !s_fn_hold_tainted;
 		if (!uploading && fn_down) {
 			if (off_hold_start == 0) {
 				off_hold_start = k_uptime_get();
