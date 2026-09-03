@@ -237,6 +237,12 @@ static volatile int s_meter_ticks = 0;   /* >0 = show the volume bar (UI counts 
 static volatile uint8_t s_stem_muted[4] = {0, 0, 0, 0};
 static volatile uint8_t s_solo_mask = 0;
 
+/* Set by ui_main() while function+track is held for the gate effect, so
+ * main()'s power-off hold (which reads the SAME function button, entirely
+ * independently) knows to ignore it instead of starting its own countdown
+ * and LED-fill animation underneath the gate gesture. */
+static volatile bool s_gate_gesture;
+
 /* Set by main() while it owns both LED rows for a gesture animation (the
  * power-off hold countdown, currently) so the UI thread's own ~125 Hz VU/meter
  * rendering doesn't fight it for the same PWM channels every 8 ms tick. */
@@ -360,9 +366,11 @@ static void ui_main(void *a, void *b, void *c)
 			int stem = -1;
 			for (int s = 0; s < 4; s++) if (cur & (1u << s)) { stem = s; break; }
 			audio_set_gate_stem(stem);
+			s_gate_gesture = true;   /* tell main()'s power-off hold to sit this one out */
 			trk_held = false;   /* don't let this also register as a solo/mute hold */
 		} else {
 			audio_set_gate_stem(-1);
+			s_gate_gesture = false;
 			if (cur) {
 				if (!trk_held) { trk_press_ms = k_uptime_get(); trk_soloed = false; trk_held = true; }
 				trk_last = cur;
@@ -834,7 +842,7 @@ int main(void)
 		if (!uploading && usb_power_off_requested())
 			enter_system_off();
 
-		bool fn_down = !(NRF_P0->IN & (1u << 27));
+		bool fn_down = !(NRF_P0->IN & (1u << 27)) && !s_gate_gesture;
 		if (!uploading && fn_down) {
 			if (off_hold_start == 0) {
 				off_hold_start = k_uptime_get();
