@@ -365,20 +365,19 @@ static void ui_main(void *a, void *b, void *c)
 		}
 		if (trk_pend_cnt >= 3) trk_stable = trk_pending;
 		uint8_t cur = trk_stable;
-		/* Basic mode's only effect: hold function + hold a track button to
-		 * gate that stem (see the TE guide's basic-mode page). Function-held
-		 * takes over the track button entirely -- no solo/mute toggle for
-		 * this gesture -- and the gate stops the instant either is released. */
+		/* Basic mode's only effect: hold function + hold one or more track
+		 * buttons to gate those stems (see the TE guide's basic-mode page).
+		 * Function-held takes over the track buttons entirely -- no solo/mute
+		 * toggle for this gesture -- and each gate stops the instant either
+		 * function or that stem's button is released. */
 		bool fn_held_now = !(NRF_P0->IN & (1u << 27));   /* active-low */
 		if (fn_held_now && cur) {
-			int stem = -1;
-			for (int s = 0; s < 4; s++) if (cur & (1u << s)) { stem = s; break; }
-			audio_set_gate_stem(stem);
+			audio_set_gate_mask(cur);
 			s_gate_gesture = true;   /* tell main()'s power-off hold to sit this one out */
 			s_fn_hold_tainted = true;   /* ...and keep sitting out until fn fully releases */
 			trk_held = false;   /* don't let this also register as a solo/mute hold */
 		} else {
-			audio_set_gate_stem(-1);
+			audio_set_gate_mask(0);
 			s_gate_gesture = false;
 			if (cur) {
 				if (!trk_held) { trk_press_ms = k_uptime_get(); trk_soloed = false; trk_held = true; }

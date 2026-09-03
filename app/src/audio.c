@@ -251,13 +251,14 @@ static int16_t adpcm_step(uint8_t nibble, int ch)
 	return s_pred[ch];
 }
 
-/* Basic mode's only effect: gate one stem while a track button is held with
- * function down (see audio.h). -1 = no stem gated. Fixed-rate chop (no
- * tempo sync available -- same constraint as looping) rather than a musical
- * subdivision: half the cycle on, half off. */
-static volatile int s_gate_stem = -1;
+/* Basic mode's only effect: gate one or more stems while their track
+ * buttons are held with function down (see audio.h). Bit s = stem s gated;
+ * 0 = none. Fixed-rate chop (no tempo sync available -- same constraint as
+ * looping) rather than a musical subdivision: half the cycle on, half off,
+ * shared across every gated stem so they chop in sync with each other. */
+static volatile uint8_t s_gate_mask;
 #define GATE_CYCLE_BLOCKS 47u   /* ~125 ms full cycle -- a typical gate/stutter rate */
-void audio_set_gate_stem(int stem) { s_gate_stem = (stem >= 0 && stem < 4) ? stem : -1; }
+void audio_set_gate_mask(uint8_t mask) { s_gate_mask = mask & 0x0Fu; }
 
 /* ── Buffer fill ────────────────────────────────────────────────────────────── */
 
@@ -266,9 +267,10 @@ void audio_set_gate_stem(int stem) { s_gate_stem = (stem >= 0 && stem < 4) ? ste
 static void decode_block(const uint8_t *blk, int32_t *buf)
 {
 	int32_t bufpeak = 0;
-	/* Snapshot once per block (not per sample): which stem, if any, is gated,
-	 * and whether this block falls in the "on" or "off" half of the cycle. */
-	int  gate_stem = s_gate_stem;
+	/* Snapshot once per block (not per sample): which stems, if any, are
+	 * gated, and whether this block falls in the "on" or "off" half of the
+	 * cycle. */
+	uint8_t gate_mask = s_gate_mask;
 	bool gate_on = (s_cur_block % GATE_CYCLE_BLOCKS) < (GATE_CYCLE_BLOCKS / 2u);
 	for (uint32_t i = 0; i < FRAMES_PER_BLOCK; i++) {
 		int32_t l = 0, r = 0;
@@ -284,7 +286,7 @@ static void decode_block(const uint8_t *blk, int32_t *buf)
 			 * silenced, so a muted fader never desyncs the decoder), then
 			 * scale by the live fader gain (0..256, 256 = unity). */
 			int32_t g = s_stem_gain[stem];
-			if (stem == gate_stem && !gate_on) g = 0;
+			if ((gate_mask & (1u << stem)) && !gate_on) g = 0;
 			l += (adpcm_step(nl, stem * 2)     * g) >> 8;
 			r += (adpcm_step(nr, stem * 2 + 1) * g) >> 8;
 		}
