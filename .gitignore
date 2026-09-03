@@ -36,3 +36,6 @@ __pycache__/
 
 # Yes - I have been AI assisted. I've been using DeepSeek hosted locally with Claude Code as a harness.  
 CLAUDE.md
+
+# Multi-agent local handoff doc (Claude/Codex/OpenCode) — local only, never committed
+AGENTS.md
