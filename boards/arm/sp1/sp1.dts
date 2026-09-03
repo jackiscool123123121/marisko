@@ -72,3 +72,18 @@
 	pinctrl-0 = <&i2s0_default>;
 	pinctrl-names = "default";
 };
+
+/* Onboard Infineon CYW20706 Bluetooth module (Classic A2DP, stock TE
+ * firmware -- see battery.c-style modules; bluetooth.c drives this over
+ * the AIROC/WICED-HCI protocol). hw-flow-control matches the RTS/CTS wired
+ * in sp1-pinctrl.dtsi; 115200 8N1 verified against community
+ * reverse-engineering of this same board. */
+&uart1 {
+	compatible = "nordic,nrf-uarte";
+	status = "okay";
+	current-speed = <115200>;
+	hw-flow-control;
+	pinctrl-0 = <&uart1_default>;
+	pinctrl-1 = <&uart1_sleep>;
+	pinctrl-names = "default", "sleep";
+};
