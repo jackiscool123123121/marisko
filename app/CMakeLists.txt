@@ -13,5 +13,4 @@ target_sources(app PRIVATE
   src/codec.c
   src/audio.c
   src/battery.c
-  src/bluetooth.c
 )

@@ -11,7 +11,6 @@
 #include "audio.h"
 #include "disk.h"
 #include "battery.h"
-#include "bluetooth.h"
 
 struct btn_db { bool raw_prev, stable; uint8_t cnt; };
 
@@ -302,9 +301,6 @@ static void ui_main(void *a, void *b, void *c)
 	int64_t play_press_ms = 0;
 	bool loop_hold_fired = false;
 	bool play_was_playing = false;
-	int64_t bt_hold_start = 0;   /* 0 = not currently holding vol+/vol- together */
-	bool    bt_fired = false;    /* guards bt_module_scan() to once per hold */
-	int64_t bt_feedback_until = 0; /* track-LED blink window after firing, wall-clock ms */
 	int vu_disp = 0;
 	int trk_disp[4] = {0, 0, 0, 0};
 	/* Smooth real-time playback position for the meters. The feed thread's
@@ -434,26 +430,6 @@ static void ui_main(void *a, void *b, void *c)
 		bool voldn_now = debounce(ain1 >=  620 && ain1 <=  860, &db_voldn);
 		bool prev_now  = debounce(ain1 >=  300 && ain1 <=  520, &db_prev);
 
-		/* Bluetooth: hold vol+ and vol- together for ~2s to scan/pair (TE's
-		 * guide). ASSUMES this resistor ladder can register both windows
-		 * simultaneously -- the four windows above were only ever
-		 * documented one at a time, so this needs confirming on real
-		 * hardware (watch `rome audio`'s ain1 while holding both) before
-		 * trusting it fully. Side (track) LEDs blink for a few seconds as
-		 * feedback once it fires; this is fire-and-forget (see bluetooth.c)
-		 * so the blink isn't tied to an actual scan-result event. */
-		if (volup_now && voldn_now) {
-			if (bt_hold_start == 0) bt_hold_start = k_uptime_get();
-			if (!bt_fired && k_uptime_get() - bt_hold_start > 2000) {
-				bt_module_scan();
-				bt_fired = true;
-				bt_feedback_until = k_uptime_get() + 3000;
-			}
-		} else {
-			bt_hold_start = 0;
-			bt_fired = false;
-		}
-
 		/* Vol +/- with hold-to-repeat: step once on the press edge, then after a
 		 * ~180 ms hold, auto-repeat every ~70 ms while held. Wall-clock based
 		 * (k_uptime_get), not tick-counted, so it stays correct regardless of
@@ -571,16 +547,7 @@ static void ui_main(void *a, void *b, void *c)
 				pwm1_set_duty(NUM_PB_LEDS - 1 - s, (uint16_t)b);
 			}
 
-			if (k_uptime_get() < bt_feedback_until) {
-				/* Bluetooth scan/pair triggered: blink the side (track) row
-				 * for a few seconds, per the guide ("scanning is indicated
-				 * on the side leds"). Fire-and-forget (see bluetooth.c) --
-				 * this is just "we sent the command", not a real scan-result
-				 * event from the module. */
-				bool blink = ((k_uptime_get() / 250) & 1) == 0;
-				for (int s = 0; s < NUM_TRK_LEDS; s++)
-					pwm0_set_duty(s, blink ? PWM_TOP : 0);
-			} else if (audio_loop_active()) {
+			if (audio_loop_active()) {
 				/* While Play is held, the track row shows the selected divider. */
 				int lit = 1 + (audio_loop_div_idx() * (NUM_TRK_LEDS - 1)) /
 				              (audio_loop_div_count() - 1);
@@ -641,7 +608,6 @@ int main(void)
 	charger_init(); /* make sure the battery actually charges; also arms
 	                  * usb_power_present()/battery_charging() for the
 	                  * off_wake gate below. */
-	bt_module_init(); /* onboard Bluetooth module UART -- see bluetooth.c */
 
 	if (off_wake) {
 		/* Power-ON gate, symmetric with the power-OFF hold: require the
