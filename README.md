@@ -4,6 +4,8 @@
 
 ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/jackiscool123123121/marisko/total)
 
+![mairisko image guide](https://github.com/jackiscool123123121/marisko/blob/main/download.png?raw=true)
+
 
 named after the [marisko flower](https://en.wikipedia.org/wiki/Cypripedium_calceolus)  
 originally forked from [softmodded/marisko](https://github.com/softmodded/marisko)
