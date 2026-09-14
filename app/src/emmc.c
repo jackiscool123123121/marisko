@@ -46,6 +46,7 @@ static uint32_t g_mb_count;   /* blocks written in current CMD25 session */
 static uint8_t  g_mb_fail;    /* 0=none 1=resp-reject 2=busy-timeout */
 static uint64_t g_busy_total; /* accumulated busy-wait µs over the session */
 static uint32_t g_busy_n;     /* blocks counted for the busy average */
+static volatile uint32_t s_crc_errors;   /* read-CRC16 mismatches */
 
 /* One bit-banged bus, two callers: the audio feed thread (prefetch reads, and
  * catalog reads on song change) and the main/USB thread (rome's disk info,
@@ -411,7 +412,14 @@ static bool cmd8_send_ext_csd(void)
 		return false;
 
 	read_bytes_bitbang(s_ext_csd, 512);
-	for (int i = 0; i < 16; i++) fast_clock_pulse(); /* drain 2 CRC bytes */
+	uint8_t c[2];
+	read_bytes_bitbang(c, 2);   /* CRC16, MSB byte first */
+	uint16_t got = ((uint16_t)c[0] << 8) | (uint16_t)c[1];
+	if (got != crc16(s_ext_csd, 512)) {
+		s_crc_errors++;
+		return false;
+	}
+	for (int i = 0; i < 16; i++) fast_clock_pulse(); /* idle before next command */
 
 	g_capacity_blocks =
 		((uint32_t)s_ext_csd[215] << 24) |
@@ -433,17 +441,27 @@ static bool cmd8_send_ext_csd(void)
 
 static bool read_block_single(uint32_t block_addr, uint8_t *buf)
 {
-	uint8_t resp[6];
-	if (!send_command(17, block_addr, resp, 48, true))
-		return false;
+	/* Same CRC16 check as emmc_read_blocks: catalog/header used to drain the
+	 * CRC unread, so a bit-bang error silently corrupted song entries. Unlike
+	 * playback, a wrong header must not be accepted as "best effort". */
+	for (int attempt = 0; attempt < 3; attempt++) {
+		uint8_t resp[6];
+		if (!send_command(17, block_addr, resp, 48, true))
+			return false;
 
-	if (!wait_for_data_start())
-		return false;
+		if (!wait_for_data_start())
+			return false;
 
-	read_bytes_bitbang(buf, 512);
-	for (int i = 0; i < 16; i++) fast_clock_pulse(); /* drain 2 CRC bytes */
-	for (int i = 0; i < 16; i++) fast_clock_pulse(); /* idle before next command */
-	return true;
+		read_bytes_bitbang(buf, 512);
+		uint8_t c[2];
+		read_bytes_bitbang(c, 2);   /* CRC16, MSB byte first */
+		uint16_t got = ((uint16_t)c[0] << 8) | (uint16_t)c[1];
+		for (int i = 0; i < 16; i++) fast_clock_pulse(); /* idle before next command */
+		if (got == crc16(buf, 512))
+			return true;
+		s_crc_errors++;
+	}
+	return false;
 }
 
 /* ── SPIM3 16 MHz data burst ─────────────────────────────────────────────────
@@ -453,7 +471,7 @@ static bool read_block_single(uint32_t block_addr, uint8_t *buf)
  * Disconnect value 0xFFFFFFFF = CONNECT bit set (nRF52840 PSEL encoding).
  * ─────────────────────────────────────────────────────────────────────────── */
 
-static uint8_t s_spim_tx[515]; /* [0xFE][data 512][crc_hi][crc_lo] */
+static uint8_t s_spim_tx[515] __attribute__((aligned(4))); /* [0xFE][data 512][crc_hi][crc_lo] */
 
 static void spim3_init(void)
 {
@@ -547,8 +565,18 @@ static bool emmc_init_locked(void)
 		g_cache_enabled = cmd6_switch(33, 1);
 
 	/* Re-read EXT_CSD so emmc_ext_csd() reflects the post-write register state
-	 * (lets `rome extcsd` confirm CACHE_CTRL/WR_REL_SET actually changed). */
-	cmd8_send_ext_csd();
+	 * (lets `rome extcsd` confirm CACHE_CTRL/WR_REL_SET actually changed).
+	 * Restore capacity/cache-size if this read fails: cmd8 updates those only
+	 * after a CRC-good payload, but a failed re-read must not leave a 0/garbage
+	 * capacity from a previous partial attempt (block 0 >= 0 rejects every I/O). */
+	{
+		uint32_t saved_cap = g_capacity_blocks;
+		uint32_t saved_cache = g_cache_size_kb;
+		if (!cmd8_send_ext_csd()) {
+			g_capacity_blocks = saved_cap;
+			g_cache_size_kb = saved_cache;
+		}
+	}
 
 	uint32_t status = 0;
 	cmd13_send_status(&status);
@@ -585,8 +613,6 @@ bool emmc_read_block(uint32_t block_addr, uint8_t *buf)
 	k_mutex_unlock(&s_bus_lock);
 	return ok;
 }
-
-static volatile uint32_t s_crc_errors;   /* read-CRC16 mismatches (corrupt bit-bang reads) */
 
 uint32_t emmc_crc_errors(void) { return s_crc_errors; }
 
@@ -717,6 +743,9 @@ bool emmc_write_multi_begin(uint32_t block_addr, uint32_t num_blocks)
 {
 	if (!g_initialized || g_multi_active) return false;
 	if (block_addr >= g_capacity_blocks) return false;
+	if (num_blocks > 0 &&
+	    (uint64_t)block_addr + num_blocks > (uint64_t)g_capacity_blocks)
+		return false;
 
 	/* Hold the bus for the WHOLE CMD25 session — released in
 	 * emmc_write_multi_end() — so nothing can interleave clocks mid-stream.

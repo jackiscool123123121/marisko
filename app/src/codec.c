@@ -402,15 +402,24 @@ void codec_refresh_diag(void)
 {
 	s_cs_page = -1;
 	cs_read(CS_PLL_LOCK_STATUS, &s_diag.live_cs_pll);
+	feed_wdt();
 	cs_read(CS_OSC_SW_STATUS,   &s_diag.live_cs_osc_sw);
+	feed_wdt();
 	cs_read(CS_HP_CTL,          &s_diag.live_cs_hp_ctl);
+	feed_wdt();
 	s_tas_page = -1;
 	tas_read(1, 46, &s_diag.live_tas_p1r46);
+	feed_wdt();
 	tas_read(1, 45, &s_diag.live_tas_p1r45);
+	feed_wdt();
 	tas_read(0, 63, &s_diag.live_tas_p0r63);
+	feed_wdt();
 	tas_read(0, 64, &s_diag.live_tas_p0r64);
+	feed_wdt();
 	tas_read(0, 65, &s_diag.live_tas_p0r65);
+	feed_wdt();
 	tas_read(0, 25, &s_diag.live_tas_p0r25);
+	feed_wdt();
 }
 
 void codec_note_audio_running(bool running)

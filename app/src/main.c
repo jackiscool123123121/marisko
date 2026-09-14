@@ -822,6 +822,7 @@ int main(void)
 		hp_apply_level(s_vol_level);
 	} else {
 		codec_speaker_volume(vol_r46[s_vol_level]);
+		codec_speaker_mute(false);
 	}
 
 	/* Spawn the UI thread (faders + LED visualizers) at a priority ABOVE the

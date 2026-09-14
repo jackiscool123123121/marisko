@@ -122,6 +122,7 @@ static bool     s_loop_cache_ok;  /* loop_len fits in cache and it is loaded */
 static uint32_t s_loop_len;       /* blocks in the loop */
 static uint32_t s_loop_pos;       /* next cache index to serve (0..loop_len-1) */
 static volatile bool s_loop_pf_dirty;  /* loop stopped: reset prefetch on feed */
+static bool     s_lvl_loaded;     /* level array read into RAM for this song */
 
 static void loop_set_end(void)
 {
@@ -139,6 +140,10 @@ static void loop_preload(void)
 	s_loop_len = s_loop_end - s_loop_start;
 	s_loop_cache_ok = false;
 	if (s_loop_len == 0 || s_loop_len > LOOP_CAP_BLOCKS) return;
+	/* s_audio_buf.loop aliases s_lvl_ram. Invalidate baked levels before the
+	 * read so a failed/partial load cannot be treated as VU data, and so a
+	 * successful load is re-fetched after the loop ends. */
+	s_lvl_loaded = false;
 	if (emmc_read_blocks(s_song_block_start + s_loop_start, s_audio_buf.loop, s_loop_len)) {
 		s_loop_cache_ok = true;
 		s_loop_pos = 0;
@@ -215,7 +220,6 @@ void audio_set_stem_gains(const uint16_t g[4])
 
 static bool              s_lvl_enabled;   /* disk reports v2 → levels present */
 static bool              s_lvl_present;   /* current song has a level region */
-static bool              s_lvl_loaded;    /* level array read into RAM for this song */
 static uint32_t          s_lvl_start;     /* first level block of current song */
 static uint32_t          s_lvl_blocks;    /* level blocks to read (capped) */
 static uint32_t          s_lvl_count;     /* valid level bytes in s_lvl_ram */
@@ -352,6 +356,7 @@ static void fill_block(int32_t *buf)
 		if (s_loop_pf_dirty) {
 			s_loop_pf_dirty = false;
 			s_loop_cache_ok = false;
+			s_lvl_loaded = false;  /* loop cache reused the level RAM */
 			s_pf_pos = s_pf_count = 0;
 		}
 
@@ -391,8 +396,11 @@ static void fill_block(int32_t *buf)
 
 		/* Refill prefetch buffer when exhausted (batched CMD18 streaming read). */
 		if (s_pf_pos >= s_pf_count) {
-			uint32_t remaining = s_song_block_count - s_cur_block;
+			uint32_t remaining = (s_cur_block < s_song_block_count)
+				? s_song_block_count - s_cur_block : 0;
 			uint32_t n = remaining < PREFETCH_BLOCKS ? remaining : PREFETCH_BLOCKS;
+			if (n == 0)
+				goto tone_fallback;
 			uint32_t t0 = k_cycle_get_32();
 			bool ok = emmc_read_blocks(s_song_block_start + s_cur_block, s_pf_buf, n);
 			uint32_t dt = k_cycle_get_32() - t0;
@@ -550,8 +558,9 @@ bool audio_init(void)
 	k_thread_name_set(&s_feed_thread, "i2s_feed");
 
 	k_sleep(K_MSEC(20));
-	codec_speaker_volume(0x20);
-	codec_speaker_mute(false);
+	/* Leave both outputs muted. main() applies the saved volume and jack
+	 * routing; unmuting the speaker here caused a boot pop (wrong level, and
+	 * the speaker path live even with headphones already plugged in). */
 
 	codec_note_audio_running(s_running);
 	codec_note_audio(0, 4);
@@ -637,7 +646,11 @@ uint8_t audio_loop_div_count(void) { return LOOP_DIV_COUNT; }
  * estimate (not s_cur_block, which freezes during eMMC reads → choppy meters). */
 static uint32_t lvl_index_at(uint32_t blk, int stem)
 {
-	if (!s_lvl_present || !s_lvl_loaded || s_lvl_count < LVL_STEMS) return 0xFFFFFFFFu;
+	/* Loop cache reuses the same RAM as the baked-level array. Reading it
+	 * while the cache is live (or after a loop until levels are reloaded)
+	 * would treat ADPCM bytes as VU peaks. */
+	if (!s_lvl_present || !s_lvl_loaded || s_lvl_count < LVL_STEMS || s_loop_cache_ok)
+		return 0xFFFFFFFFu;
 	uint32_t idx = (blk / LVL_DECIM) * LVL_STEMS + (uint32_t)stem;
 	uint32_t last = s_lvl_count - LVL_STEMS + (uint32_t)stem;
 	if (idx > last) idx = last;
@@ -660,14 +673,14 @@ uint32_t audio_stem_level_at(uint32_t blk, int stem)
  * Falls back to the on-device peak-hold for discs without baked levels. */
 uint32_t audio_vu_level_at(uint32_t blk)
 {
-	if (s_lvl_present) {
-		if (!s_lvl_loaded || s_lvl_count < LVL_STEMS) return 0;
+	if (s_lvl_present && s_lvl_loaded && s_lvl_count >= LVL_STEMS && !s_loop_cache_ok) {
 		uint32_t sum = 0;
 		for (int s = 0; s < 4; s++) sum += audio_stem_level_at(blk, s);   /* 0..1020 */
 		sum >>= 2;                                                        /* 0..255  */
 		return sum > 255 ? 255 : sum;
 	}
-	/* fallback: on-device peak-hold (0..32767), scaled to 0..255. */
+	/* fallback: on-device peak-hold (0..32767), scaled to 0..255.
+	 * Also used while the loop cache owns the level RAM. */
 	int32_t v = s_peak;
 	s_peak = 0;
 	v >>= 7;

@@ -113,16 +113,30 @@ typedef struct {
 
 static upload_t    g_upload;
 static disk_header_t g_hdr;
-static bool        g_hdr_cached;
 static uint8_t     g_ul_fail;       /* 0=none 1=usb-read-timeout 2=resp-reject 3=busy-timeout 4=unknown-write-fail */
 static uint32_t    g_ul_fail_block; /* block index where it failed */
 
 static bool ensure_hdr(void)
 {
-	if (g_hdr_cached) return true;
+	/* Always re-read. A cached copy taken before a volume save (settings_flush
+	 * in main) would write the old vol_level back on SONG_BEGIN/COMMIT and
+	 * undo the user's persisted volume. One extra block read is cheap. */
 	if (!disk_read_header(&g_hdr)) return false;
-	g_hdr_cached = true;
 	return true;
+}
+
+/* Tear down an in-progress upload so it cannot leave a half-written catalog
+ * entry or hold the CMD25 bus lock forever (host disconnect / retry). */
+static void upload_abort(void)
+{
+	if (g_upload.multi_begun) {
+		emmc_write_multi_end();
+		g_upload.multi_begun = false;
+	}
+	if (g_upload.active) {
+		disk_remove_song(g_upload.song_idx);
+		g_upload.active = false;
+	}
 }
 
 /* ── Command handlers ────────────────────────────────────────────────────────── */
@@ -234,8 +248,8 @@ static void handle_battery(void)
 
 static void handle_codec_diag(void)
 {
-	/* Returns the snapshot captured at boot — no live I2C here, because a TWIM
-	 * read can block K_FOREVER and trip the watchdog from this context. */
+	/* Live codec registers + upload-fail fields. I2C is bounded by the nrfx
+	 * transfer timeout; codec_refresh_diag() feeds the WDT between reads. */
 	codec_refresh_diag();
 	codec_diag_t diag;
 	codec_get_diag(&diag);
@@ -258,14 +272,14 @@ static void handle_codec_diag(void)
 
 static void handle_disk_format(void)
 {
-	g_hdr_cached = false;
-	if (g_upload.multi_begun) {
-		emmc_write_multi_end();
-		g_upload.multi_begun = false;
-	}
-	g_upload.active = false;
+	audio_pause();
+	k_sleep(K_MSEC(10));
+	upload_abort();
 	if (!disk_format()) { send_err(); return; }
-	g_hdr_cached = false;
+	/* Catalog and data are gone; drop the in-RAM playlist so Play doesn't
+	 * stream wiped blocks as audio. */
+	audio_set_playlist(0, 0);
+	audio_load_song(0, 0);
 	send_ok(NULL, 0);
 }
 
@@ -275,7 +289,11 @@ static void handle_disk_format(void)
 static void handle_song_begin(const uint8_t *payload, uint32_t plen)
 {
 	if (plen < 28) { send_err(); return; }
-	if (g_upload.active) { send_err(); return; }
+	/* A retry (or a new song) after a dropped session used to fail forever
+	 * because the previous BEGIN left g_upload.active set. Abort the stale
+	 * one so the host can recover without a reboot. */
+	if (g_upload.active)
+		upload_abort();
 
 	/* Pause audio BEFORE the first disk touch — ensure_hdr() reads block 0, so
 	 * pausing after it left that read racing the feed thread. (The eMMC bus
@@ -292,6 +310,14 @@ static void handle_song_begin(const uint8_t *payload, uint32_t plen)
 		lvl_blocks = (uint32_t)payload[28]        | ((uint32_t)payload[29] << 8) |
 		             ((uint32_t)payload[30] << 16) | ((uint32_t)payload[31] << 24);
 
+	if (audio_blocks == 0) { send_err(); return; }
+	uint32_t total_blocks = audio_blocks + lvl_blocks;
+	if (total_blocks < audio_blocks) { send_err(); return; }   /* uint32 overflow */
+	if (g_hdr.next_free_block < DISK_DATA_START_BLOCK) { send_err(); return; }
+	if ((uint64_t)g_hdr.next_free_block + total_blocks > (uint64_t)emmc_capacity_blocks()) {
+		send_err(); return;
+	}
+
 	disk_song_entry_t entry = {0};
 	for (int i = 0; i < 24; i++) entry.name[i] = (char)payload[i];
 	entry.name[23]    = '\0';
@@ -302,7 +328,6 @@ static void handle_song_begin(const uint8_t *payload, uint32_t plen)
 	if (idx == 0xFFFFu) { send_err(); return; }
 
 	if (!disk_write_header(&g_hdr)) { send_err(); return; }
-	g_hdr_cached = true;
 
 	g_upload.active          = true;
 	g_upload.multi_begun     = false;
@@ -427,20 +452,7 @@ static void handle_song_multiblock(const uint8_t *count_payload, uint32_t plen)
 	if (ok) {
 		send_ok(NULL, 0);
 	} else {
-		emmc_write_multi_end();
-		g_upload.multi_begun = false;
-		g_upload.active = false;
-		/* SONG_BEGIN already wrote a catalog entry with the FULL declared
-		 * block_count, optimistically, before any data was confirmed written
-		 * -- a genuine (non-recovered) failure here otherwise leaves that
-		 * entry claiming a complete song of the full size while only
-		 * g_upload.blocks_written blocks of it actually exist on disk. Left
-		 * as-is, `rome info` lists it as a normal song and playing it would
-		 * read past written data into whatever was there before (leftover
-		 * bytes from a prior song, or unformatted noise). Mark it deleted --
-		 * same effect as `rome song rm` -- so a failed upload never leaves a
-		 * playable-looking entry that isn't actually complete. */
-		disk_remove_song(g_upload.song_idx);
+		upload_abort();
 		send_err();
 		uint32_t quiet = 0;
 		while (quiet < 10) {   /* ~100 ms of continuous silence */
@@ -456,6 +468,9 @@ static void handle_song_multiblock(const uint8_t *count_payload, uint32_t plen)
 static void handle_song_block(const uint8_t *payload, uint32_t plen)
 {
 	if (!g_upload.active || plen < 512) { send_err(); return; }
+	/* CMD24 in the middle of an open CMD25 session would nest on the recursive
+	 * bus lock and bit-bang a single-block write into the multi-block stream. */
+	if (g_upload.multi_begun) { send_err(); return; }
 	if (g_upload.blocks_written >= g_upload.blocks_expected) { send_err(); return; }
 
 	uint32_t block_addr = g_upload.block_start + g_upload.blocks_written;
@@ -471,10 +486,18 @@ static void handle_song_block(const uint8_t *payload, uint32_t plen)
 static void handle_song_commit(void)
 {
 	if (!g_upload.active) { send_err(); return; }
+	/* BEGIN records the full declared size in the catalog. Committing early
+	 * left a song whose block_count overlapped the next song's data. */
+	if (g_upload.blocks_written != g_upload.blocks_expected) { send_err(); return; }
 
 	/* Close CMD25 session */
 	if (g_upload.multi_begun) {
-		emmc_write_multi_end();
+		if (!emmc_write_multi_end()) {
+			g_upload.multi_begun = false;
+			upload_abort();
+			send_err();
+			return;
+		}
 		g_upload.multi_begun = false;
 	}
 
@@ -485,17 +508,18 @@ static void handle_song_commit(void)
 	entry.block_count = g_upload.audio_blocks;
 	if (!disk_write_song(g_upload.song_idx, &entry)) { send_err(); return; }
 
-	/* Advance next_free_block past everything written (audio + levels) */
+	/* Re-read so a volume save that landed on disk is not rolled back. */
+	if (!disk_read_header(&g_hdr)) { send_err(); return; }
 	g_hdr.next_free_block = g_upload.block_start + g_upload.blocks_written;
 	g_upload.active = false;
 
 	if (!disk_write_header(&g_hdr)) { send_err(); return; }
-	g_hdr_cached = true;
 
 	/* Arm the song we just wrote so it is playable immediately. The catalog
 	 * scan only ran once at boot (main.c), so uploading to a device that had
 	 * no songs left the feed thread with block_count == 0 — play did nothing
 	 * until a reboot, with no indication why. */
+	audio_pause();
 	audio_set_source(AUDIO_SRC_ADPCM);
 	audio_set_playlist(g_hdr.song_count, g_upload.song_idx);
 	audio_set_levels_enabled(g_hdr.version >= 2);
@@ -529,7 +553,12 @@ static void handle_song_swap(const uint8_t *payload, uint32_t plen)
 
 	disk_song_entry_t a, b;
 	if (!disk_read_song(idx_a, &a) || !disk_read_song(idx_b, &b)) { send_err(); return; }
-	if (!disk_write_song(idx_a, &b) || !disk_write_song(idx_b, &a)) { send_err(); return; }
+	if (!disk_write_song(idx_a, &b)) { send_err(); return; }
+	if (!disk_write_song(idx_b, &a)) {
+		disk_write_song(idx_a, &a);   /* rollback so the catalog is not left with two copies of B */
+		send_err();
+		return;
+	}
 	send_ok(NULL, 0);
 }
 
@@ -610,6 +639,12 @@ void usb_cdc_poll(void)
 {
 	if (!cdc_dev) return;
 
+	static bool s_dtr_was_set;
+	bool dtr = usb_cdc_connected();
+	if (s_dtr_was_set && !dtr && g_upload.active)
+		upload_abort();
+	s_dtr_was_set = dtr;
+
 	if (ring_buf_size_get(&g_rx_rb) < 5) return;
 
 	uint8_t hdr[5];
@@ -633,6 +668,9 @@ void usb_cdc_poll(void)
 	}
 
 	if (plen > 0 && !usb_read_bytes(s_block_buf, plen, 1000000)) {
+		/* Header already consumed; leftover payload would be parsed as the
+		 * next command and desync the stream. */
+		ring_buf_reset(&g_rx_rb);
 		send_err();
 		return;
 	}

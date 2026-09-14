@@ -22,7 +22,8 @@ typedef enum {
 } audio_source_t;
 
 /* Configure + start the I2S stream and spawn the feed thread.
- * Unmutes the speaker. Returns false if the I2S device isn't ready. */
+ * Leaves the speaker muted; the caller applies jack routing + volume.
+ * Returns false if the I2S device isn't ready. */
 bool audio_init(void);
 
 /* Select what the feed thread emits. */
